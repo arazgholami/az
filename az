@@ -21,6 +21,8 @@ final class AzTab
     public int $savedRevision = 0;
     /** @var array<int,array{lines:array<int,string>,cursorLine:int,cursorCol:int,rowOffset:int,colOffset:int,revision:int}> */
     public array $undoStack = [];
+    /** @var array<int,array{lines:array<int,string>,cursorLine:int,cursorCol:int,rowOffset:int,colOffset:int,revision:int}> */
+    public array $redoStack = [];
     public string $name;
 
     public function __construct(?string $path = null, array $lines = [''])
@@ -33,6 +35,8 @@ final class AzTab
 
 final class Az
 {
+    private const PASTE_PREFIX = "\0AZPASTE:";
+
     private string $root;
     /** @var AzTab[] */
     private array $tabs = [];
@@ -77,6 +81,8 @@ final class Az
     private int $autocompleteLine = 0;
     private int $autocompleteStartCol = 0;
     private string $autocompletePrefix = '';
+    /** @var array<string,float> */
+    private array $lastRecoveryWrite = [];
 
     public function __construct(array $argv)
     {
@@ -87,22 +93,25 @@ final class Az
 
         if (is_file($target)) {
             $this->root = dirname($target);
+            $this->expanded[$this->root] = true;
             $this->openFile($target, false);
         } else {
             $this->root = is_dir($target) ? $target : getcwd();
-            $this->newTab(false);
-            $this->focus = 'tree';
-            $this->showWelcome = true;
-            $this->message = 'Folder opened. Ctrl+O quick open, Ctrl+T switches tree/editor';
+            $this->expanded[$this->root] = true;
+            if (!$this->restoreSession()) {
+                $this->newTab(false);
+                $this->focus = 'tree';
+                $this->showWelcome = true;
+                $this->message = 'Folder opened. Ctrl+O quick open, Ctrl+P commands, Ctrl+T switches tree/editor';
+            }
         }
-
-        $this->expanded[$this->root] = true;
     }
 
     public function run(): void
     {
         $this->enableRawMode();
         $this->clearScreen();
+        $this->offerRecovery();
 
         if ($this->showWelcome) {
             $this->render();
@@ -128,15 +137,16 @@ final class Az
     {
         $this->originalStty = trim((string) shell_exec('stty -g 2>/dev/null'));
         shell_exec('stty -echo -icanon -isig ixoff -ixon min 0 time 5 2>/dev/null');
-        fwrite(STDOUT, "\033[?25l");
+        fwrite(STDOUT, "\033[?25l\033[?2004h");
     }
 
     private function cleanup(): void
     {
+        $this->saveSession();
         if ($this->originalStty !== '') {
             shell_exec('stty ' . escapeshellarg($this->originalStty) . ' 2>/dev/null');
         }
-        fwrite(STDOUT, "\033[0m\033[?25h\033[2J\033[H");
+        fwrite(STDOUT, "\033[?2004l\033[0m\033[?25h\033[2J\033[H");
     }
 
     private function clearScreen(): void
@@ -172,17 +182,18 @@ final class Az
     {
         return [
             '  EDITING                         NAVIGATION',
-            '    Ctrl+S  Save                  Ctrl+O  Quick open',
-            '    Ctrl+Z  Undo                  Ctrl+T  Show/focus tree',
-            '    Ctrl+W  Remove line           Ctrl+H  Hide/show tree',
-            '    Ctrl+F  Find                  Alt+1-9 Switch tab',
-            '    Ctrl+R  Replace               Ctrl+D  Close tab',
-            '    Tab     Complete              Enter   Accept completion',
+            '    Ctrl+S  Save                  Ctrl+O  Quick open file/symbol',
+            '    Ctrl+Z  Undo                  Ctrl+Y  Redo',
+            '    Ctrl+P  Command palette       Ctrl+G  Go to line',
+            '    Ctrl+W  Remove line           Ctrl+T  Show/focus tree',
+            '    Ctrl+F  Find                  Ctrl+H  Hide/show tree',
+            '    Ctrl+R  Replace               Alt+1-9 Switch tab',
+            '    Tab     Complete              Ctrl+D  Close tab',
             '    %term   Find/replace ignoring case',
             '    Ctrl+C  Copy                  Ctrl+/  Help',
             '    Ctrl+X  Cut                   Ctrl+Q  Quit',
-            '    Ctrl+V  Paste',
-            '    Ctrl+A  Select all',
+            '    Ctrl+V  Paste                 Ctrl+A  Select all',
+            '    Ctrl+O  file:line or :line',
         ];
     }
 
@@ -295,6 +306,9 @@ final class Az
                 }
             }
             stream_set_blocking(STDIN, true);
+            if ($seq === "[200~") {
+                return self::PASTE_PREFIX . $this->readBracketedPaste();
+            }
             return $seq;
         }
 
@@ -323,6 +337,15 @@ final class Az
     {
         if ($this->statusFlash !== null) {
             $this->statusFlash = null;
+        }
+
+        if (str_starts_with($key, self::PASTE_PREFIX)) {
+            $this->closeAutocomplete();
+            if ($this->focus === 'editor') {
+                $this->insertText(substr($key, strlen(self::PASTE_PREFIX)));
+                $this->message = 'Pasted';
+            }
+            return;
         }
 
         if ($this->focus === 'editor' && $this->handleAutocompleteKey($key)) {
@@ -373,29 +396,38 @@ final class Az
             return true;
         }
 
+        if ($key === "\x19" || $this->isCtrlShiftLetter($key, 'z')) { // Ctrl+Y or Ctrl+Shift+Z where available
+            $this->redo();
+            return true;
+        }
+
         if ($key === "\x0f") { // Ctrl+O
             $this->quickOpen();
             return true;
         }
 
+        if ($key === "\x10") { // Ctrl+P
+            $this->commandPalette();
+            return true;
+        }
+
+        if ($key === "\x07") { // Ctrl+G
+            $this->goToLinePrompt();
+            return true;
+        }
+
+        if ($this->isCtrlShiftLetter($key, 'f')) { // Ctrl+Shift+F where available
+            $this->projectSearchPrompt();
+            return true;
+        }
+
         if ($key === "\x14") { // Ctrl+T
-            if ($this->sidebarHidden) {
-                $this->sidebarHidden = false;
-                $this->focus = 'tree';
-                $this->message = 'Tree shown and focused';
-            } else {
-                $this->focus = $this->focus === 'tree' ? 'editor' : 'tree';
-                $this->message = $this->focus === 'tree' ? 'Tree focused' : 'Editor focused';
-            }
+            $this->toggleTreeFocus();
             return true;
         }
 
         if ($key === "\x08") { // Ctrl+H
-            $this->sidebarHidden = !$this->sidebarHidden;
-            if ($this->sidebarHidden && $this->focus === 'tree') {
-                $this->focus = 'editor';
-            }
-            $this->message = $this->sidebarHidden ? 'Tree hidden' : 'Tree shown';
+            $this->toggleSidebar();
             return true;
         }
 
@@ -456,17 +488,14 @@ final class Az
 
     private function quickOpen(): void
     {
-        $files = $this->collectQuickOpenFiles($this->root, 1000);
-        if (!$files) {
-            $this->message = 'No files found';
-            return;
-        }
-
+        $files = $this->collectQuickOpenFiles($this->root, 1200);
+        $symbols = $this->collectQuickOpenSymbols($files, 1200);
         $query = '';
         $selected = 0;
 
         while (true) {
-            $matches = $this->filterQuickOpenFiles($files, $query);
+            $parsed = $this->parseQuickOpenQuery($query);
+            $matches = $parsed['bareLine'] ? [] : $this->filterQuickOpenItems($files, $symbols, $parsed['query']);
             if ($selected >= count($matches)) {
                 $selected = max(0, count($matches) - 1);
             }
@@ -474,15 +503,24 @@ final class Az
             $this->renderQuickOpen($query, $matches, $selected);
             $key = $this->readKey();
 
+            if (str_starts_with($key, self::PASTE_PREFIX)) {
+                $query .= str_replace(["\r\n", "\r", "\n"], ' ', substr($key, strlen(self::PASTE_PREFIX)));
+                $selected = 0;
+                continue;
+            }
+
             if ($key === "\r" || $key === "\n") {
-                if (isset($matches[$selected])) {
-                    $this->openFile($matches[$selected]['path']);
-                    $this->revealPathInTree($matches[$selected]['path']);
-                    $this->focus = 'editor';
-                    $this->message = 'Opened ' . $matches[$selected]['label'];
-                } else {
-                    $this->message = 'No match';
+                if ($parsed['bareLine']) {
+                    $this->goToLine($parsed['line'] ?? 1);
+                    return;
                 }
+                if (isset($matches[$selected])) {
+                    $item = $matches[$selected];
+                    $line = $parsed['line'] ?? ($item['line'] ?? null);
+                    $this->openPathAtLine($item['path'], $line);
+                    return;
+                }
+                $this->message = 'No match';
                 return;
             }
 
@@ -491,12 +529,12 @@ final class Az
                 return;
             }
 
-            if ($key === "\033[A" || $key === "\x10") { // Up or Ctrl+P
+            if ($key === "\033[A" || $key === "\x10") { // Up or Ctrl+P inside popup
                 $selected = max(0, $selected - 1);
                 continue;
             }
 
-            if ($key === "\033[B" || $key === "\x0e") { // Down or Ctrl+N
+            if ($key === "\033[B" || $key === "\x0e") { // Down or Ctrl+N inside popup
                 $selected = min(max(0, count($matches) - 1), $selected + 1);
                 continue;
             }
@@ -574,25 +612,59 @@ final class Az
 
     /**
      * @param array<int,array{path:string,label:string}> $files
-     * @return array<int,array{path:string,label:string}>
+     * @param array<int,array{type:string,path:string,label:string,detail:string,line:int,key:string}> $symbols
+     * @return array<int,array{type:string,path:string,label:string,detail:string,line?:int,key?:string}>
      */
-    private function filterQuickOpenFiles(array $files, string $query): array
+    private function filterQuickOpenItems(array $files, array $symbols, string $query): array
     {
         $query = trim($query);
+        $items = [];
+        foreach ($files as $file) {
+            $items[] = [
+                'type' => 'file',
+                'path' => $file['path'],
+                'label' => $file['label'],
+                'detail' => 'file',
+                'key' => $file['label'],
+            ];
+        }
+
+        if ($query !== '') {
+            $items = array_merge($items, $symbols);
+        }
+
         if ($query === '') {
-            return array_slice($files, 0, 12);
+            return array_slice($items, 0, 12);
         }
 
         $ranked = [];
-        foreach ($files as $file) {
-            $score = $this->quickOpenScore($file['label'], $query);
+        foreach ($items as $item) {
+            $score = $this->quickOpenScore(($item['key'] ?? $item['label']) . ' ' . $item['detail'], $query);
             if ($score !== null) {
-                $ranked[] = ['score' => $score, 'file' => $file];
+                if (($item['type'] ?? '') === 'symbol') {
+                    $score += 8;
+                }
+                $ranked[] = ['score' => $score, 'item' => $item];
             }
         }
 
         usort($ranked, fn(array $a, array $b): int => $a['score'] <=> $b['score']);
-        return array_slice(array_map(fn(array $item): array => $item['file'], $ranked), 0, 12);
+        return array_slice(array_map(fn(array $item): array => $item['item'], $ranked), 0, 12);
+    }
+
+    /**
+     * @return array{query:string,bareLine:bool,line:?int}
+     */
+    private function parseQuickOpenQuery(string $query): array
+    {
+        $trimmed = trim($query);
+        if (preg_match('/^:(\d+)$/', $trimmed, $m)) {
+            return ['query' => '', 'bareLine' => true, 'line' => max(1, (int) $m[1])];
+        }
+        if (preg_match('/^(.+):(\d+)$/', $trimmed, $m)) {
+            return ['query' => trim($m[1]), 'bareLine' => false, 'line' => max(1, (int) $m[2])];
+        }
+        return ['query' => $trimmed, 'bareLine' => false, 'line' => null];
     }
 
     private function quickOpenScore(string $label, string $query): ?int
@@ -620,7 +692,108 @@ final class Az
     }
 
     /**
-     * @param array<int,array{path:string,label:string}> $matches
+     * @param array<int,array{path:string,label:string}> $files
+     * @return array<int,array{type:string,path:string,label:string,detail:string,line:int,key:string}>
+     */
+    private function collectQuickOpenSymbols(array $files, int $limit): array
+    {
+        $symbols = [];
+        foreach ($files as $file) {
+            if (count($symbols) >= $limit) {
+                break;
+            }
+            $syntax = $this->syntaxForPath($file['path']);
+            if (!in_array($syntax, ['php', 'blade', 'html', 'css'], true)) {
+                continue;
+            }
+            $size = @filesize($file['path']);
+            if ($size !== false && $size > 1024 * 1024) {
+                continue;
+            }
+            $text = @file_get_contents($file['path']);
+            if ($text === false || $text === '') {
+                continue;
+            }
+            $text = str_replace(["\r\n", "\r"], "\n", $text);
+            foreach ($this->extractSymbols($text, $syntax) as $symbol) {
+                $symbols[] = [
+                    'type' => 'symbol',
+                    'path' => $file['path'],
+                    'label' => $symbol['kind'] . ' ' . $symbol['name'],
+                    'detail' => $file['label'] . ':' . $symbol['line'],
+                    'line' => $symbol['line'],
+                    'key' => $symbol['name'] . ' ' . $file['label'],
+                ];
+                if (count($symbols) >= $limit) {
+                    break 2;
+                }
+            }
+        }
+        return $symbols;
+    }
+
+    /**
+     * @return array<int,array{name:string,kind:string,line:int}>
+     */
+    private function extractSymbols(string $text, string $syntax): array
+    {
+        $symbols = [];
+        if ($syntax === 'php' || $syntax === 'blade') {
+            if (preg_match_all('/\b(function|class|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)/u', $text, $m, PREG_OFFSET_CAPTURE)) {
+                foreach ($m[2] as $i => $match) {
+                    $symbols[] = ['name' => $match[0], 'kind' => $m[1][$i][0], 'line' => $this->lineNumberForOffset($text, $match[1])];
+                }
+            }
+            if ($syntax === 'blade' && preg_match_all('/@(section|if|foreach|forelse|while|switch|component)\b[^\n]*/u', $text, $m, PREG_OFFSET_CAPTURE)) {
+                foreach ($m[0] as $match) {
+                    $name = trim($match[0]);
+                    $symbols[] = ['name' => $this->truncatePlain($name, 40), 'kind' => 'blade', 'line' => $this->lineNumberForOffset($text, $match[1])];
+                }
+            }
+        }
+        if ($syntax === 'html' || $syntax === 'blade') {
+            if (preg_match_all('/<([A-Za-z][A-Za-z0-9:-]*)(?:\s+[^>]*\b(?:id|class)=["\'][^"\']+["\'])?[^>]*>/u', $text, $m, PREG_OFFSET_CAPTURE)) {
+                foreach ($m[1] as $i => $match) {
+                    $full = $m[0][$i][0];
+                    if (str_starts_with($full, '</') || str_starts_with($full, '<!')) {
+                        continue;
+                    }
+                    $name = $match[0];
+                    if (preg_match('/\bid=["\']([^"\']+)/u', $full, $id)) {
+                        $name .= '#' . $id[1];
+                    } elseif (preg_match('/\bclass=["\']([^"\']+)/u', $full, $class)) {
+                        $name .= '.' . strtok($class[1], ' ');
+                    }
+                    $symbols[] = ['name' => $name, 'kind' => 'tag', 'line' => $this->lineNumberForOffset($text, $match[1])];
+                    if (count($symbols) >= 300) {
+                        break;
+                    }
+                }
+            }
+        }
+        if ($syntax === 'css') {
+            $lines = explode("\n", $text);
+            foreach ($lines as $i => $line) {
+                if (str_contains($line, '{')) {
+                    $selector = trim(strstr($line, '{', true) ?: $line);
+                    if ($selector !== '' && !str_starts_with($selector, '@')) {
+                        $symbols[] = ['name' => $this->truncatePlain($selector, 40), 'kind' => 'css', 'line' => $i + 1];
+                    }
+                }
+            }
+        }
+
+        usort($symbols, fn(array $a, array $b): int => $a['line'] <=> $b['line']);
+        return array_slice($symbols, 0, 400);
+    }
+
+    private function lineNumberForOffset(string $text, int $offset): int
+    {
+        return substr_count(substr($text, 0, max(0, $offset)), "\n") + 1;
+    }
+
+    /**
+     * @param array<int,array{type:string,path:string,label:string,detail:string,line?:int,key?:string}> $matches
      */
     private function renderQuickOpen(string $query, array $matches, int $selected): void
     {
@@ -637,8 +810,8 @@ final class Az
         $startRow = max(2, (int) floor(($this->rows - $panelHeight) / 2));
         $inner = $panelWidth - 2;
 
-        $title = ' Quick Open '; 
-        $queryLine = ($query === '' ? 'type to search files' : $query);
+        $title = ' Quick Open ';
+        $queryLine = ($query === '' ? 'type file, symbol, file:line, or :line' : $query);
 
         $out = "\033[?25l";
         $out .= "\033[{$startRow};{$startCol}H\033[1;36m╔" . str_repeat('═', $inner) . "╗\033[0m";
@@ -650,9 +823,17 @@ final class Az
             $row = $startRow + 4 + $i;
             $match = $matches[$i] ?? null;
             $prefix = $i === $selected ? ' › ' : '   ';
-            $label = $match ? $prefix . $match['label'] : '';
+            $label = '';
+            if ($match) {
+                $icon = ($match['type'] ?? 'file') === 'symbol' ? 'ƒ ' : '  ';
+                $detail = $match['detail'] ?? '';
+                $left = $prefix . $icon . $match['label'];
+                $right = $detail !== '' ? '  ' . $detail : '';
+                $space = max(1, $inner - $this->visualWidth($left) - $this->visualWidth($right));
+                $label = $left . str_repeat(' ', $space) . $right;
+            }
             if (!$matches && $i === 0) {
-                $label = '   No matching files';
+                $label = preg_match('/^:\d+$/', trim($query)) ? '   Enter to go to line' : '   No matching files or symbols';
             }
             $line = $this->fitPlain($label, $inner);
             $style = $i === $selected && $match ? "\033[48;5;220m\033[30m" : "\033[48;5;236m\033[37m";
@@ -701,6 +882,11 @@ final class Az
     private function handleTreeKey(string $key): void
     {
         $this->refreshTree();
+
+        if ($key === 'n') { $this->newTreeFilePrompt(); return; }
+        if ($key === 'N') { $this->newTreeFolderPrompt(); return; }
+        if ($key === 'r' || $key === 'R') { $this->renameTreePathPrompt(); return; }
+        if ($key === "\033[3~") { $this->deleteTreePathPrompt(); return; }
 
         if ($key === "\033[A") {
             $this->treeIndex = max(0, $this->treeIndex - 1);
@@ -929,6 +1115,12 @@ final class Az
 
     private function renderTreeLine(int $screenLine): string
     {
+        $hints = $this->sidebarShortcutLines();
+        $hintStart = max(0, $this->contentHeight - count($hints));
+        if ($screenLine >= $hintStart && isset($hints[$screenLine - $hintStart])) {
+            return "[2m" . $this->fitPlain($hints[$screenLine - $hintStart], $this->treeWidth) . "[0m";
+        }
+
         $index = $this->treeScroll + $screenLine;
         $row = $this->treeRows[$index] ?? null;
         if (!$row) {
@@ -1331,6 +1523,7 @@ final class Az
                 return;
             }
         }
+        $this->deleteRecoveryForTab($tab);
         array_splice($this->tabs, $this->tabIndex, 1);
         if (!$this->tabs) {
             $this->newTab(false);
@@ -1354,13 +1547,14 @@ final class Az
             $tab->path = $path;
             $tab->name = basename($path);
         }
-        $ok = @file_put_contents($tab->path, implode("\n", $tab->lines));
-        if ($ok === false) {
+        $ok = $this->atomicWriteFile($tab->path, implode("\n", $tab->lines));
+        if (!$ok) {
             $this->message = 'Save failed: ' . $tab->path;
             return;
         }
         $tab->savedRevision = $tab->revision;
         $tab->modified = false;
+        $this->deleteRecoveryForTab($tab);
         $this->needsTreeRefresh = true;
         $this->message = '';
         $this->statusFlash = 'Saved';
@@ -1663,10 +1857,11 @@ final class Az
             $line = $tab->lines[$tab->cursorLine];
             $before = substr($line, 0, $tab->cursorCol);
             $after = substr($line, $tab->cursorCol);
+            $indent = $this->indentForNewline($before, $after);
             $tab->lines[$tab->cursorLine] = $before;
-            array_splice($tab->lines, $tab->cursorLine + 1, 0, [$after]);
+            array_splice($tab->lines, $tab->cursorLine + 1, 0, [$indent . ltrim($after, " 	")]);
             $tab->cursorLine++;
-            $tab->cursorCol = 0;
+            $tab->cursorCol = strlen($indent);
             $this->markEdited($tab);
         } finally {
             if ($groupStarted) {
@@ -1875,6 +2070,55 @@ final class Az
             return;
         }
 
+        $tab->redoStack[] = $this->currentUndoState($tab);
+        if (count($tab->redoStack) > 200) {
+            array_shift($tab->redoStack);
+        }
+
+        $this->restoreUndoState($tab, $state);
+        $this->clearSelection();
+        $this->message = 'Undone';
+    }
+
+    private function redo(): void
+    {
+        $tab = $this->tab();
+        $state = array_pop($tab->redoStack);
+        if ($state === null) {
+            $this->message = 'Nothing to redo';
+            return;
+        }
+
+        $tab->undoStack[] = $this->currentUndoState($tab);
+        if (count($tab->undoStack) > 200) {
+            array_shift($tab->undoStack);
+        }
+
+        $this->restoreUndoState($tab, $state);
+        $this->clearSelection();
+        $this->message = 'Redone';
+    }
+
+    /**
+     * @return array{lines:array<int,string>,cursorLine:int,cursorCol:int,rowOffset:int,colOffset:int,revision:int}
+     */
+    private function currentUndoState(AzTab $tab): array
+    {
+        return [
+            'lines' => $tab->lines,
+            'cursorLine' => $tab->cursorLine,
+            'cursorCol' => $tab->cursorCol,
+            'rowOffset' => $tab->rowOffset,
+            'colOffset' => $tab->colOffset,
+            'revision' => $tab->revision,
+        ];
+    }
+
+    /**
+     * @param array{lines:array<int,string>,cursorLine:int,cursorCol:int,rowOffset:int,colOffset:int,revision:int} $state
+     */
+    private function restoreUndoState(AzTab $tab, array $state): void
+    {
         $tab->lines = $state['lines'];
         if ($tab->lines === []) {
             $tab->lines = [''];
@@ -1885,8 +2129,11 @@ final class Az
         $tab->colOffset = max(0, $state['colOffset']);
         $tab->revision = $state['revision'];
         $tab->modified = $tab->revision !== $tab->savedRevision;
-        $this->clearSelection();
-        $this->message = 'Undone';
+        if ($tab->modified) {
+            $this->writeRecoveryForTab($tab);
+        } else {
+            $this->deleteRecoveryForTab($tab);
+        }
     }
 
     private function beginUndoGroup(): void
@@ -1908,14 +2155,8 @@ final class Az
         }
 
         $tab = $this->tab();
-        $tab->undoStack[] = [
-            'lines' => $tab->lines,
-            'cursorLine' => $tab->cursorLine,
-            'cursorCol' => $tab->cursorCol,
-            'rowOffset' => $tab->rowOffset,
-            'colOffset' => $tab->colOffset,
-            'revision' => $tab->revision,
-        ];
+        $tab->undoStack[] = $this->currentUndoState($tab);
+        $tab->redoStack = [];
 
         if (count($tab->undoStack) > 200) {
             array_shift($tab->undoStack);
@@ -1930,6 +2171,7 @@ final class Az
     {
         $tab->revision++;
         $tab->modified = $tab->revision !== $tab->savedRevision;
+        $this->writeRecoveryForTab($tab);
     }
 
     private function moveWordLeft(bool $select): void
@@ -2025,6 +2267,784 @@ final class Az
         // OSC 52 works in many terminals and safely does nothing in others.
         $encoded = base64_encode($text);
         fwrite(STDOUT, "\033]52;c;{$encoded}\007");
+    }
+
+    private function readBracketedPaste(): string
+    {
+        $end = "\033[201~";
+        $buffer = '';
+        stream_set_blocking(STDIN, true);
+        while (true) {
+            $chunk = fread(STDIN, 4096);
+            if ($chunk === false || $chunk === '') {
+                break;
+            }
+            $buffer .= $chunk;
+            $pos = strpos($buffer, $end);
+            if ($pos !== false) {
+                return substr($buffer, 0, $pos);
+            }
+            if (strlen($buffer) > 5 * 1024 * 1024) {
+                return $buffer;
+            }
+        }
+        return $buffer;
+    }
+
+    private function indentForNewline(string $before, string $after): string
+    {
+        preg_match('/^[ \t]*/', $before, $m);
+        $indent = $m[0] ?? '';
+        $trimmedBefore = rtrim($before);
+        $trimmedAfter = ltrim($after);
+        if ($trimmedBefore !== '' && preg_match('/(?:\{|\[|\(|:)\s*(?:\/\/.*)?$/', $trimmedBefore) === 1) {
+            $indent .= '    ';
+        }
+        if ($trimmedAfter !== '' && preg_match('/^[}\])]/', $trimmedAfter) === 1 && strlen($indent) >= 4) {
+            $indent = substr($indent, 0, -4);
+        }
+        return $indent;
+    }
+
+    private function autoCloseHtmlTag(): void
+    {
+        $tab = $this->tab();
+        $syntax = $this->syntaxForPath($tab->path);
+        if ($syntax !== 'html' && $syntax !== 'blade') {
+            return;
+        }
+        $line = $tab->lines[$tab->cursorLine] ?? '';
+        $before = substr($line, 0, $tab->cursorCol);
+        if (!preg_match('/<([A-Za-z][A-Za-z0-9:-]*)(?:\s[^<>]*)?>$/u', $before, $m)) {
+            return;
+        }
+        $tag = strtolower($m[1]);
+        if (str_ends_with(rtrim($before), '/>') || in_array($tag, $this->htmlVoidTags(), true)) {
+            return;
+        }
+        $closing = '</' . $m[1] . '>';
+        $cursor = $tab->cursorCol;
+        $this->recordUndoState();
+        $tab->lines[$tab->cursorLine] = substr($line, 0, $cursor) . $closing . substr($line, $cursor);
+        $tab->cursorCol = $cursor;
+        $this->markEdited($tab);
+        $this->message = 'Closed <' . $m[1] . '>';
+    }
+
+    private function htmlVoidTags(): array
+    {
+        return ['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'];
+    }
+
+    private function goToLinePrompt(): void
+    {
+        $value = trim($this->prompt('Go to line: ', (string) ($this->tab()->cursorLine + 1)));
+        if ($this->promptCancelled || $value === '') {
+            $this->message = 'Go to line cancelled';
+            return;
+        }
+        if (!ctype_digit($value)) {
+            $this->message = 'Line must be a number';
+            return;
+        }
+        $this->goToLine((int) $value);
+    }
+
+    private function goToLine(int $line): void
+    {
+        $tab = $this->tab();
+        $target = max(1, min($line, count($tab->lines)));
+        $tab->cursorLine = $target - 1;
+        $tab->cursorCol = $this->clampByteCol($tab->lines[$tab->cursorLine], $tab->cursorCol);
+        $this->focus = 'editor';
+        $this->clearSelection();
+        $this->message = 'Line ' . $target;
+    }
+
+    private function openPathAtLine(string $path, ?int $line = null): void
+    {
+        $this->openFile($path);
+        $this->revealPathInTree($path);
+        $this->focus = 'editor';
+        if ($line !== null) {
+            $this->goToLine($line);
+        } else {
+            $this->message = 'Opened ' . $this->relativePath($path);
+        }
+    }
+
+    private function commandPalette(): void
+    {
+        $commands = $this->commandItems();
+        $query = '';
+        $selected = 0;
+
+        while (true) {
+            $matches = $this->filterCommandItems($commands, $query);
+            if ($selected >= count($matches)) {
+                $selected = max(0, count($matches) - 1);
+            }
+            $this->renderCommandPalette($query, $matches, $selected);
+            $key = $this->readKey();
+
+            if (str_starts_with($key, self::PASTE_PREFIX)) {
+                $query .= str_replace(["\r\n", "\r", "\n"], ' ', substr($key, strlen(self::PASTE_PREFIX)));
+                $selected = 0;
+                continue;
+            }
+            if ($key === "\r" || $key === "\n") {
+                if (isset($matches[$selected])) {
+                    $this->runCommand($matches[$selected]['action']);
+                } else {
+                    $this->message = 'No command';
+                }
+                return;
+            }
+            if ($key === "\033") {
+                $this->message = 'Command cancelled';
+                return;
+            }
+            if ($key === "\033[A" || $key === "\x10") {
+                $selected = max(0, $selected - 1);
+                continue;
+            }
+            if ($key === "\033[B" || $key === "\x0e") {
+                $selected = min(max(0, count($matches) - 1), $selected + 1);
+                continue;
+            }
+            if ($key === "\177" || $key === "\x08") {
+                $query = $this->removeLastUtf8Char($query);
+                $selected = 0;
+                continue;
+            }
+            if ($key === "\x15") {
+                $query = '';
+                $selected = 0;
+                continue;
+            }
+            if ($this->isPrintable($key)) {
+                $query .= $key;
+                $selected = 0;
+            }
+        }
+    }
+
+    private function commandItems(): array
+    {
+        return [
+            ['label' => 'Save', 'detail' => 'Ctrl+S', 'action' => 'save'],
+            ['label' => 'Save as', 'detail' => 'save current tab to a new path', 'action' => 'save-as'],
+            ['label' => 'New file', 'detail' => 'create file in project', 'action' => 'new-file'],
+            ['label' => 'New folder', 'detail' => 'create folder in project', 'action' => 'new-folder'],
+            ['label' => 'Rename selected file or folder', 'detail' => 'tree/current file', 'action' => 'rename-path'],
+            ['label' => 'Delete selected file or folder', 'detail' => 'moves nowhere, asks first', 'action' => 'delete-path'],
+            ['label' => 'Go to line', 'detail' => 'Ctrl+G', 'action' => 'go-line'],
+            ['label' => 'Search project', 'detail' => 'find text in files', 'action' => 'project-search'],
+            ['label' => 'Find in current file', 'detail' => 'Ctrl+F', 'action' => 'find'],
+            ['label' => 'Replace in current file', 'detail' => 'Ctrl+R', 'action' => 'replace'],
+            ['label' => 'Toggle sidebar', 'detail' => 'Ctrl+H', 'action' => 'toggle-tree'],
+            ['label' => 'Focus tree/editor', 'detail' => 'Ctrl+T', 'action' => 'focus-tree'],
+            ['label' => 'Close tab', 'detail' => 'Ctrl+D', 'action' => 'close-tab'],
+            ['label' => 'Help', 'detail' => 'Ctrl+/', 'action' => 'help'],
+            ['label' => 'Quit', 'detail' => 'Ctrl+Q', 'action' => 'quit'],
+        ];
+    }
+
+    private function filterCommandItems(array $commands, string $query): array
+    {
+        $query = trim($query);
+        if ($query === '') {
+            return array_slice($commands, 0, 12);
+        }
+        $ranked = [];
+        foreach ($commands as $command) {
+            $score = $this->quickOpenScore($command['label'] . ' ' . $command['detail'], $query);
+            if ($score !== null) {
+                $ranked[] = ['score' => $score, 'command' => $command];
+            }
+        }
+        usort($ranked, fn(array $a, array $b): int => $a['score'] <=> $b['score']);
+        return array_slice(array_map(fn(array $item): array => $item['command'], $ranked), 0, 12);
+    }
+
+    private function renderCommandPalette(string $query, array $matches, int $selected): void
+    {
+        $oldMessage = $this->message;
+        $this->message = 'Command palette';
+        $this->render();
+        $this->message = $oldMessage;
+        $this->renderSimplePicker(' Command Palette ', $query === '' ? 'type a command' : $query, $matches, $selected, 'No matching commands');
+    }
+
+    private function runCommand(string $action): void
+    {
+        switch ($action) {
+            case 'save': $this->saveCurrentTab(); break;
+            case 'save-as': $this->saveCurrentTabAs(); break;
+            case 'new-file': $this->createFilePrompt(); break;
+            case 'new-folder': $this->createFolderPrompt(); break;
+            case 'rename-path': $this->renameTreePathPrompt(true); break;
+            case 'delete-path': $this->deleteTreePathPrompt(true); break;
+            case 'go-line': $this->goToLinePrompt(); break;
+            case 'project-search': $this->projectSearchPrompt(); break;
+            case 'find': $this->findPrompt(); break;
+            case 'replace': $this->replacePrompt(); break;
+            case 'toggle-tree': $this->toggleSidebar(); break;
+            case 'focus-tree': $this->toggleTreeFocus(); break;
+            case 'close-tab': $this->closeCurrentTab(); break;
+            case 'help': $this->showShortcutsHelp(); break;
+            case 'quit': $this->confirmQuit(); break;
+            default: $this->message = 'Unknown command'; break;
+        }
+    }
+
+    private function renderSimplePicker(string $title, string $queryLine, array $matches, int $selected, string $empty): void
+    {
+        $rows = min(12, max(1, $this->rows - 8));
+        $panelWidth = min($this->cols - 6, max(50, (int) floor($this->cols * 0.62)));
+        $panelWidth = max(30, $panelWidth);
+        $panelHeight = $rows + 4;
+        $startCol = max(1, (int) floor(($this->cols - $panelWidth) / 2));
+        $startRow = max(2, (int) floor(($this->rows - $panelHeight) / 2));
+        $inner = $panelWidth - 2;
+
+        $out = "\033[?25l";
+        $out .= "\033[{$startRow};{$startCol}H\033[1;36m╔" . str_repeat('═', $inner) . "╗\033[0m";
+        $out .= "\033[" . ($startRow + 1) . ";{$startCol}H\033[1;36m║\033[0m\033[48;5;24m\033[37m" . $this->fitPlain($title, $inner) . "\033[0m\033[1;36m║\033[0m";
+        $out .= "\033[" . ($startRow + 2) . ";{$startCol}H\033[1;36m║\033[0m\033[48;5;236m\033[37m" . $this->fitPlain($queryLine, $inner) . "\033[0m\033[1;36m║\033[0m";
+        $out .= "\033[" . ($startRow + 3) . ";{$startCol}H\033[1;36m╠" . str_repeat('═', $inner) . "╣\033[0m";
+
+        for ($i = 0; $i < $rows; $i++) {
+            $row = $startRow + 4 + $i;
+            $match = $matches[$i] ?? null;
+            $text = '';
+            if ($match) {
+                $prefix = $i === $selected ? ' › ' : '   ';
+                $detail = $match['detail'] ?? '';
+                $left = $prefix . ($match['label'] ?? '');
+                $right = $detail !== '' ? '  ' . $detail : '';
+                $space = max(1, $inner - $this->visualWidth($left) - $this->visualWidth($right));
+                $text = $left . str_repeat(' ', $space) . $right;
+            } elseif (!$matches && $i === 0) {
+                $text = '   ' . $empty;
+            }
+            $style = $i === $selected && $match ? "\033[48;5;220m\033[30m" : "\033[48;5;236m\033[37m";
+            $out .= "\033[{$row};{$startCol}H\033[1;36m║\033[0m{$style}" . $this->fitPlain($text, $inner) . "\033[0m\033[1;36m║\033[0m";
+        }
+
+        $bottom = $startRow + $panelHeight - 1;
+        $out .= "\033[{$bottom};{$startCol}H\033[1;36m╚" . str_repeat('═', $inner) . "╝\033[0m";
+        fwrite(STDOUT, $out);
+    }
+
+    private function projectSearchPrompt(): void
+    {
+        $query = '';
+        $selected = 0;
+        while (true) {
+            $matches = $query === '' ? [] : $this->collectProjectSearchResults($query, 80);
+            if ($selected >= count($matches)) {
+                $selected = max(0, count($matches) - 1);
+            }
+            $oldMessage = $this->message;
+            $this->message = 'Project search';
+            $this->render();
+            $this->message = $oldMessage;
+            $this->renderSimplePicker(' Project Search ', $query === '' ? 'type text to search project' : $query, $matches, $selected, 'No matches');
+            $key = $this->readKey();
+
+            if (str_starts_with($key, self::PASTE_PREFIX)) {
+                $query .= str_replace(["\r\n", "\r", "\n"], ' ', substr($key, strlen(self::PASTE_PREFIX)));
+                $selected = 0;
+                continue;
+            }
+            if ($key === "\r" || $key === "\n") {
+                if (isset($matches[$selected])) {
+                    $this->openPathAtLine($matches[$selected]['path'], $matches[$selected]['line']);
+                } else {
+                    $this->message = $query === '' ? 'Search cancelled' : 'No match';
+                }
+                return;
+            }
+            if ($key === "\033") {
+                $this->message = 'Search cancelled';
+                return;
+            }
+            if ($key === "\033[A" || $key === "\x10") {
+                $selected = max(0, $selected - 1);
+                continue;
+            }
+            if ($key === "\033[B" || $key === "\x0e") {
+                $selected = min(max(0, count($matches) - 1), $selected + 1);
+                continue;
+            }
+            if ($key === "\177" || $key === "\x08") {
+                $query = $this->removeLastUtf8Char($query);
+                $selected = 0;
+                continue;
+            }
+            if ($key === "\x15") {
+                $query = '';
+                $selected = 0;
+                continue;
+            }
+            if ($this->isPrintable($key)) {
+                $query .= $key;
+                $selected = 0;
+            }
+        }
+    }
+
+    private function collectProjectSearchResults(string $query, int $limit): array
+    {
+        $files = $this->collectQuickOpenFiles($this->root, 2000);
+        $results = [];
+        foreach ($files as $file) {
+            if (count($results) >= $limit) {
+                break;
+            }
+            $size = @filesize($file['path']);
+            if ($size !== false && $size > 1024 * 1024) {
+                continue;
+            }
+            $text = @file_get_contents($file['path']);
+            if ($text === false || $text === '') {
+                continue;
+            }
+            $lines = explode("\n", str_replace(["\r\n", "\r"], "\n", $text));
+            foreach ($lines as $i => $line) {
+                if (stripos($line, $query) !== false) {
+                    $snippet = trim($line);
+                    $results[] = [
+                        'label' => $file['label'] . ':' . ($i + 1),
+                        'detail' => $this->truncatePlain($snippet, 42),
+                        'path' => $file['path'],
+                        'line' => $i + 1,
+                    ];
+                    if (count($results) >= $limit) {
+                        break 2;
+                    }
+                }
+            }
+        }
+        return $results;
+    }
+
+    private function toggleSidebar(): void
+    {
+        $this->sidebarHidden = !$this->sidebarHidden;
+        if ($this->sidebarHidden && $this->focus === 'tree') {
+            $this->focus = 'editor';
+        }
+        $this->message = $this->sidebarHidden ? 'Tree hidden' : 'Tree shown';
+    }
+
+    private function toggleTreeFocus(): void
+    {
+        if ($this->sidebarHidden) {
+            $this->sidebarHidden = false;
+            $this->focus = 'tree';
+            $this->message = 'Tree shown and focused';
+        } else {
+            $this->focus = $this->focus === 'tree' ? 'editor' : 'tree';
+            $this->message = $this->focus === 'tree' ? 'Tree focused' : 'Editor focused';
+        }
+    }
+
+    private function selectedTreePath(bool $preferCurrentFile = false): string
+    {
+        $this->refreshTree();
+        if (!$preferCurrentFile && isset($this->treeRows[$this->treeIndex])) {
+            return $this->treeRows[$this->treeIndex]['path'];
+        }
+        $tab = $this->tab();
+        if ($tab->path !== null) {
+            return $tab->path;
+        }
+        return $this->treeRows[$this->treeIndex]['path'] ?? $this->root;
+    }
+
+    private function baseDirForTreeAction(): string
+    {
+        $path = $this->selectedTreePath();
+        return is_dir($path) ? $path : dirname($path);
+    }
+
+    private function newTreeFilePrompt(): void
+    {
+        $this->createFilePrompt($this->baseDirForTreeAction());
+    }
+
+    private function newTreeFolderPrompt(): void
+    {
+        $this->createFolderPrompt($this->baseDirForTreeAction());
+    }
+
+    private function createFilePrompt(?string $baseDir = null): void
+    {
+        $name = trim($this->prompt('New file: '));
+        if ($this->promptCancelled || $name === '') {
+            $this->message = 'New file cancelled';
+            return;
+        }
+        $path = $this->absolutePath($name, $baseDir ?? $this->root);
+        if (is_dir($path)) {
+            $this->message = 'That is a folder';
+            return;
+        }
+        if (!is_dir(dirname($path))) {
+            @mkdir(dirname($path), 0775, true);
+        }
+        if (!file_exists($path) && @file_put_contents($path, '') === false) {
+            $this->message = 'Could not create file';
+            return;
+        }
+        $this->needsTreeRefresh = true;
+        $this->openPathAtLine($path, 1);
+        $this->message = 'Created ' . $this->relativePath($path);
+    }
+
+    private function createFolderPrompt(?string $baseDir = null): void
+    {
+        $name = trim($this->prompt('New folder: '));
+        if ($this->promptCancelled || $name === '') {
+            $this->message = 'New folder cancelled';
+            return;
+        }
+        $path = $this->absolutePath($name, $baseDir ?? $this->root);
+        if (!is_dir($path) && !@mkdir($path, 0775, true)) {
+            $this->message = 'Could not create folder';
+            return;
+        }
+        $this->expanded[dirname($path)] = true;
+        $this->needsTreeRefresh = true;
+        $this->revealPathInTree($path);
+        $this->message = 'Created folder ' . $this->relativePath($path);
+    }
+
+    private function renameTreePathPrompt(bool $preferCurrentFile = false): void
+    {
+        $path = $this->selectedTreePath($preferCurrentFile);
+        if ($path === $this->root) {
+            $this->message = 'Cannot rename project root';
+            return;
+        }
+        $default = basename($path);
+        $name = trim($this->prompt('Rename to: ', $default));
+        if ($this->promptCancelled || $name === '' || $name === $default) {
+            $this->message = 'Rename cancelled';
+            return;
+        }
+        $newPath = $this->absolutePath($name, dirname($path));
+        if (file_exists($newPath)) {
+            $this->message = 'Target already exists';
+            return;
+        }
+        if (!@rename($path, $newPath)) {
+            $this->message = 'Rename failed';
+            return;
+        }
+        foreach ($this->tabs as $tab) {
+            if ($tab->path === $path) {
+                $tab->path = $newPath;
+                $tab->name = basename($newPath);
+            } elseif ($tab->path !== null && is_dir($newPath) && str_starts_with($tab->path, $path . DIRECTORY_SEPARATOR)) {
+                $tab->path = $newPath . substr($tab->path, strlen($path));
+                $tab->name = basename($tab->path);
+            }
+        }
+        $this->needsTreeRefresh = true;
+        $this->revealPathInTree($newPath);
+        $this->message = 'Renamed';
+    }
+
+    private function deleteTreePathPrompt(bool $preferCurrentFile = false): void
+    {
+        $path = $this->selectedTreePath($preferCurrentFile);
+        if ($path === $this->root) {
+            $this->message = 'Cannot delete project root';
+            return;
+        }
+        $wasDir = is_dir($path);
+        $answer = strtolower($this->prompt('Delete ' . basename($path) . '? y/N: '));
+        if ($this->promptCancelled || $answer !== 'y') {
+            $this->message = 'Delete cancelled';
+            return;
+        }
+        if (!$this->deletePath($path)) {
+            $this->message = 'Delete failed';
+            return;
+        }
+        for ($i = count($this->tabs) - 1; $i >= 0; $i--) {
+            $tab = $this->tabs[$i];
+            if ($tab->path === $path || ($wasDir && $tab->path !== null && str_starts_with($tab->path, $path . DIRECTORY_SEPARATOR))) {
+                $this->deleteRecoveryForTab($tab);
+                array_splice($this->tabs, $i, 1);
+            }
+        }
+        if (!$this->tabs) {
+            $this->newTab(false);
+        }
+        $this->tabIndex = max(0, min($this->tabIndex, count($this->tabs) - 1));
+        $this->needsTreeRefresh = true;
+        $this->message = 'Deleted';
+    }
+
+    private function deletePath(string $path): bool
+    {
+        if (is_file($path) || is_link($path)) {
+            return @unlink($path);
+        }
+        if (!is_dir($path)) {
+            return false;
+        }
+        $items = @scandir($path);
+        if ($items === false) {
+            return false;
+        }
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            if (!$this->deletePath($path . DIRECTORY_SEPARATOR . $item)) {
+                return false;
+            }
+        }
+        return @rmdir($path);
+    }
+
+    private function saveCurrentTabAs(): void
+    {
+        $tab = $this->tab();
+        $default = $tab->path ? $this->relativePath($tab->path) : '';
+        $name = trim($this->prompt('Save as: ', $default));
+        if ($this->promptCancelled || $name === '') {
+            $this->message = 'Save as cancelled';
+            return;
+        }
+        $oldPath = $tab->path;
+        $tab->path = $this->absolutePath($name, $this->root);
+        $tab->name = basename($tab->path);
+        $this->saveCurrentTab();
+        if ($oldPath !== null && $oldPath !== $tab->path) {
+            $this->deleteRecoveryFile($oldPath, basename($oldPath));
+        }
+    }
+
+    private function sidebarShortcutLines(): array
+    {
+        if ($this->treeWidth < 18) {
+            return ['Enter open', 'N file  R rename', 'Del delete'];
+        }
+        return ['Enter open/fold', 'N file  Shift+N folder', 'R rename  Del delete'];
+    }
+
+    private function atomicWriteFile(string $path, string $contents): bool
+    {
+        $dir = dirname($path);
+        if (!is_dir($dir) && !@mkdir($dir, 0775, true)) {
+            return false;
+        }
+        $tmp = $dir . DIRECTORY_SEPARATOR . '.' . basename($path) . '.aztmp.' . getmypid() . '.' . bin2hex(random_bytes(3));
+        $bytes = @file_put_contents($tmp, $contents, LOCK_EX);
+        if ($bytes === false) {
+            @unlink($tmp);
+            return false;
+        }
+        if (file_exists($path)) {
+            $perms = @fileperms($path);
+            if ($perms !== false) {
+                @chmod($tmp, $perms & 0777);
+            }
+        }
+        if (!@rename($tmp, $path)) {
+            @unlink($tmp);
+            return false;
+        }
+        return true;
+    }
+
+    private function stateDir(): string
+    {
+        $base = getenv('XDG_STATE_HOME');
+        if (!$base) {
+            $home = getenv('HOME') ?: sys_get_temp_dir();
+            $base = rtrim($home, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . '.local' . DIRECTORY_SEPARATOR . 'state';
+        }
+        $dir = rtrim($base, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'az';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        return $dir;
+    }
+
+    private function sessionFile(): string
+    {
+        return $this->stateDir() . DIRECTORY_SEPARATOR . 'session-' . sha1($this->root) . '.json';
+    }
+
+    private function recoveryDir(): string
+    {
+        $dir = $this->stateDir() . DIRECTORY_SEPARATOR . 'recovery';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        return $dir;
+    }
+
+    private function recoveryKey(?string $path, string $name = ''): string
+    {
+        return sha1($this->root . "\0" . ($path ?? ('untitled:' . $name)));
+    }
+
+    private function recoveryFileForTab(AzTab $tab): string
+    {
+        return $this->recoveryDir() . DIRECTORY_SEPARATOR . $this->recoveryKey($tab->path, $tab->name) . '.json';
+    }
+
+    private function writeRecoveryForTab(AzTab $tab): void
+    {
+        if (!$tab->modified) {
+            $this->deleteRecoveryForTab($tab);
+            return;
+        }
+        $file = $this->recoveryFileForTab($tab);
+        $now = microtime(true);
+        if (($this->lastRecoveryWrite[$file] ?? 0.0) > $now - 0.25) {
+            return;
+        }
+        $this->lastRecoveryWrite[$file] = $now;
+        $data = [
+            'root' => $this->root,
+            'path' => $tab->path,
+            'name' => $tab->name,
+            'lines' => $tab->lines,
+            'cursorLine' => $tab->cursorLine,
+            'cursorCol' => $tab->cursorCol,
+            'revision' => $tab->revision,
+            'savedRevision' => $tab->savedRevision,
+            'timestamp' => time(),
+        ];
+        $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if (is_string($json)) {
+            $this->atomicWriteFile($file, $json);
+        }
+    }
+
+    private function deleteRecoveryForTab(AzTab $tab): void
+    {
+        @unlink($this->recoveryFileForTab($tab));
+    }
+
+    private function deleteRecoveryFile(?string $path, string $name = ''): void
+    {
+        @unlink($this->recoveryDir() . DIRECTORY_SEPARATOR . $this->recoveryKey($path, $name) . '.json');
+    }
+
+    private function offerRecovery(): void
+    {
+        foreach (glob($this->recoveryDir() . DIRECTORY_SEPARATOR . '*.json') ?: [] as $file) {
+            $data = json_decode((string) @file_get_contents($file), true);
+            if (!is_array($data) || ($data['root'] ?? '') !== $this->root || !isset($data['lines']) || !is_array($data['lines'])) {
+                continue;
+            }
+            $path = isset($data['path']) && is_string($data['path']) ? $data['path'] : null;
+            $timestamp = (int) ($data['timestamp'] ?? 0);
+            if ($path !== null && is_file($path) && filemtime($path) !== false && (int) filemtime($path) >= $timestamp) {
+                @unlink($file);
+                continue;
+            }
+            $name = (string) ($data['name'] ?? ($path ? basename($path) : 'Untitled'));
+            $answer = strtolower($this->prompt('Recover unsaved changes for ' . $name . '? y/N: '));
+            if ($this->promptCancelled || $answer !== 'y') {
+                @unlink($file);
+                continue;
+            }
+            $tab = new AzTab($path, array_map('strval', $data['lines']));
+            $tab->cursorLine = max(0, min((int) ($data['cursorLine'] ?? 0), count($tab->lines) - 1));
+            $tab->cursorCol = $this->clampByteCol($tab->lines[$tab->cursorLine], (int) ($data['cursorCol'] ?? 0));
+            $tab->revision = (int) ($data['revision'] ?? 1);
+            $tab->savedRevision = (int) ($data['savedRevision'] ?? 0);
+            $tab->modified = true;
+            if (isset($this->tabs[0]) && $this->isHiddenInitialTab(0, $this->tabs[0])) {
+                $this->tabs[0] = $tab;
+                $this->tabIndex = 0;
+                $this->hideInitialUntitled = false;
+            } else {
+                $this->tabs[] = $tab;
+                $this->tabIndex = count($this->tabs) - 1;
+            }
+            $this->message = 'Recovered ' . $name;
+        }
+    }
+
+    private function restoreSession(): bool
+    {
+        $file = $this->sessionFile();
+        $data = json_decode((string) @file_get_contents($file), true);
+        if (!is_array($data) || !isset($data['tabs']) || !is_array($data['tabs'])) {
+            return false;
+        }
+        $tabs = [];
+        foreach ($data['tabs'] as $item) {
+            if (!is_array($item) || !isset($item['path']) || !is_string($item['path']) || !is_file($item['path'])) {
+                continue;
+            }
+            $contents = @file_get_contents($item['path']);
+            if ($contents === false) {
+                continue;
+            }
+            $lines = explode("\n", str_replace(["\r\n", "\r"], "\n", $contents));
+            $tab = new AzTab($item['path'], $lines);
+            $tab->cursorLine = max(0, min((int) ($item['cursorLine'] ?? 0), count($tab->lines) - 1));
+            $tab->cursorCol = $this->clampByteCol($tab->lines[$tab->cursorLine], (int) ($item['cursorCol'] ?? 0));
+            $tab->rowOffset = max(0, (int) ($item['rowOffset'] ?? 0));
+            $tabs[] = $tab;
+        }
+        if (!$tabs) {
+            return false;
+        }
+        $this->tabs = $tabs;
+        $this->tabIndex = max(0, min((int) ($data['tabIndex'] ?? 0), count($this->tabs) - 1));
+        $this->expanded = isset($data['expanded']) && is_array($data['expanded']) ? array_filter($data['expanded'], 'is_bool') : [$this->root => true];
+        $this->expanded[$this->root] = true;
+        $this->sidebarHidden = (bool) ($data['sidebarHidden'] ?? false);
+        $this->focus = (string) ($data['focus'] ?? 'editor') === 'tree' ? 'tree' : 'editor';
+        $this->showWelcome = false;
+        $this->message = 'Session restored';
+        return true;
+    }
+
+    private function saveSession(): void
+    {
+        if (!$this->tabs) {
+            return;
+        }
+        $tabs = [];
+        foreach ($this->tabs as $tab) {
+            if ($tab->path === null || !is_file($tab->path)) {
+                continue;
+            }
+            $tabs[] = [
+                'path' => $tab->path,
+                'cursorLine' => $tab->cursorLine,
+                'cursorCol' => $tab->cursorCol,
+                'rowOffset' => $tab->rowOffset,
+            ];
+        }
+        $data = [
+            'root' => $this->root,
+            'tabs' => $tabs,
+            'tabIndex' => min($this->tabIndex, max(0, count($tabs) - 1)),
+            'expanded' => $this->expanded,
+            'sidebarHidden' => $this->sidebarHidden,
+            'focus' => $this->focus,
+            'timestamp' => time(),
+        ];
+        $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if (is_string($json)) {
+            $this->atomicWriteFile($this->sessionFile(), $json);
+        }
     }
 
     private function prompt(string $label, string $default = ''): string
