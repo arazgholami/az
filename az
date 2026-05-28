@@ -190,7 +190,7 @@ final class Az
             '    Ctrl+R  Replace               Alt+1-9 Switch tab',
             '    Tab     Complete              Ctrl+D  Close tab',
             '    %term   Find/replace ignoring case',
-            '    Ctrl+C  Copy                  Ctrl+/  Help',
+            '    Ctrl+C  Copy                  Ctrl+/  Welcome',
             '    Ctrl+X  Cut                   Ctrl+Q  Quit',
             '    Ctrl+V  Paste                 Ctrl+A  Select all',
             '    Ctrl+O  file:line or :line',
@@ -200,16 +200,7 @@ final class Az
     private function showShortcutsHelp(): void
     {
         $this->render();
-        $lines = array_merge([
-            '',
-            '  KEYBOARD SHORTCUTS',
-            '',
-        ], $this->shortcutHelpLines(), [
-            '',
-            '  [Enter] Start/Resume Editing',
-        ]);
-
-        $this->renderPopupBox($lines);
+        $this->renderWelcomeScreen();
         $this->waitForKey();
         $this->message = '';
     }
@@ -501,7 +492,7 @@ final class Az
             }
 
             $this->renderQuickOpen($query, $matches, $selected);
-            $key = $this->readKey();
+            $key = $this->waitForKey();
 
             if (str_starts_with($key, self::PASTE_PREFIX)) {
                 $query .= str_replace(["\r\n", "\r", "\n"], ' ', substr($key, strlen(self::PASTE_PREFIX)));
@@ -988,7 +979,7 @@ final class Az
         $wrappedRows = $this->wrappedRows();
         [$cursorVisualIndex, $cursorVisualCol] = $this->cursorVisualPosition($wrappedRows);
         $cursorRow = 2 + ($cursorVisualIndex - $tab->rowOffset);
-        $cursorCol = $this->editorStartCol() + $cursorVisualCol;
+        $cursorCol = $this->editorStartCol() + $this->lineNumberGutterWidth() + $cursorVisualCol;
         if ($this->focus === 'tree' && !$this->sidebarHidden) {
             $visibleIndex = $this->treeIndex - $this->treeScroll;
             $cursorRow = 2 + max(0, min($this->contentHeight - 1, $visibleIndex));
@@ -1097,7 +1088,9 @@ final class Az
             $editorText = '';
             if ($wrapped) {
                 $lineNo = $wrapped['line'];
-                $editorText = $this->renderEditorLine($tab->lines[$lineNo], $lineNo, $syntax, $wrapped['start'], $wrapped['end']);
+                $editorText = $this->renderLineNumberGutter($wrapped) . $this->renderEditorLine($tab->lines[$lineNo], $lineNo, $syntax, $wrapped['start'], $wrapped['end']);
+            } else {
+                $editorText = $this->renderLineNumberGutter(null);
             }
 
             if (!$this->sidebarHidden) {
@@ -1111,6 +1104,32 @@ final class Az
         }
 
         return $out;
+    }
+
+    private function lineNumberGutterWidth(): int
+    {
+        $digits = strlen((string) max(1, count($this->tab()->lines)));
+        return max(4, $digits + 3);
+    }
+
+    private function editorTextWidth(): int
+    {
+        return max(1, $this->editorWidth - $this->lineNumberGutterWidth());
+    }
+
+    /**
+     * @param array{line:int,start:int,end:int}|null $wrapped
+     */
+    private function renderLineNumberGutter(?array $wrapped): string
+    {
+        $digits = max(1, $this->lineNumberGutterWidth() - 3);
+        $plain = str_repeat(' ', $digits) . ' │ ';
+
+        if ($wrapped !== null && $wrapped['start'] === 0) {
+            $plain = str_pad((string) ($wrapped['line'] + 1), $digits, ' ', STR_PAD_LEFT) . ' │ ';
+        }
+
+        return "\033[2m" . $this->fitPlain($plain, $this->lineNumberGutterWidth()) . "\033[0m";
     }
 
     private function renderTreeLine(int $screenLine): string
@@ -1160,12 +1179,14 @@ final class Az
         $visualCol = 0;
         $emitted = 0;
 
-        for ($i = $startCol; $i < $endCol && $emitted < $this->editorWidth;) {
+        $textWidth = $this->editorTextWidth();
+
+        for ($i = $startCol; $i < $endCol && $emitted < $textWidth;) {
             $char = $this->utf8CharAt($line, $i);
             $byteLen = max(1, strlen($char));
             $charWidth = ($char === "\t") ? ($tabSize - ($visualCol % $tabSize)) : $this->charDisplayWidth($char);
 
-            if ($charWidth > 0 && $emitted + $charWidth > $this->editorWidth) {
+            if ($charWidth > 0 && $emitted + $charWidth > $textWidth) {
                 break;
             }
 
@@ -1173,7 +1194,7 @@ final class Az
             $selected = $selection && $this->positionInRange($lineNo, $i, $selection);
 
             if ($char === "\t") {
-                $pad = str_repeat(' ', max(1, min($charWidth, $this->editorWidth - $emitted)));
+                $pad = str_repeat(' ', max(1, min($charWidth, $textWidth - $emitted)));
                 $out .= $selected ? "\033[7m{$pad}\033[0m" : $pad;
             } else {
                 $safeChar = $this->escapeControl($char);
@@ -1196,7 +1217,7 @@ final class Az
     private function wrappedRows(): array
     {
         $tab = $this->tab();
-        $width = max(1, $this->editorWidth);
+        $width = $this->editorTextWidth();
         $rows = [];
 
         foreach ($tab->lines as $lineNo => $line) {
@@ -1270,7 +1291,7 @@ final class Az
             if ($tab->cursorCol >= $row['start'] && ($tab->cursorCol < $row['end'] || $isLastSegmentForLine)) {
                 $sliceLen = max(0, $tab->cursorCol - $row['start']);
                 $visualCol = $this->visualWidth(substr($tab->lines[$tab->cursorLine], $row['start'], $sliceLen));
-                return [$idx, min($visualCol, max(0, $this->editorWidth - 1))];
+                return [$idx, min($visualCol, max(0, $this->editorTextWidth() - 1))];
             }
         }
 
@@ -2385,7 +2406,7 @@ final class Az
                 $selected = max(0, count($matches) - 1);
             }
             $this->renderCommandPalette($query, $matches, $selected);
-            $key = $this->readKey();
+            $key = $this->waitForKey();
 
             if (str_starts_with($key, self::PASTE_PREFIX)) {
                 $query .= str_replace(["\r\n", "\r", "\n"], ' ', substr($key, strlen(self::PASTE_PREFIX)));
@@ -2445,7 +2466,7 @@ final class Az
             ['label' => 'Toggle sidebar', 'detail' => 'Ctrl+H', 'action' => 'toggle-tree'],
             ['label' => 'Focus tree/editor', 'detail' => 'Ctrl+T', 'action' => 'focus-tree'],
             ['label' => 'Close tab', 'detail' => 'Ctrl+D', 'action' => 'close-tab'],
-            ['label' => 'Help', 'detail' => 'Ctrl+/', 'action' => 'help'],
+            ['label' => 'Welcome screen', 'detail' => 'Ctrl+/', 'action' => 'help'],
             ['label' => 'Quit', 'detail' => 'Ctrl+Q', 'action' => 'quit'],
         ];
     }
@@ -2551,7 +2572,7 @@ final class Az
             $this->render();
             $this->message = $oldMessage;
             $this->renderSimplePicker(' Project Search ', $query === '' ? 'type text to search project' : $query, $matches, $selected, 'No matches');
-            $key = $this->readKey();
+            $key = $this->waitForKey();
 
             if (str_starts_with($key, self::PASTE_PREFIX)) {
                 $query .= str_replace(["\r\n", "\r", "\n"], ' ', substr($key, strlen(self::PASTE_PREFIX)));
