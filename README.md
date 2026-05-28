@@ -6,7 +6,7 @@ It opens ready to type, works with files or project folders, and gives you the p
 
 No plugins. No build step. No external dependencies except PHP CLI.
 
-![az screenshot](az-screenshot.jpg)
+![az](az-editor.jpg)
 
 ## Why az?
 
