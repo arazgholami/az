@@ -204,7 +204,6 @@ final class Az
             ' | (_| |/ / ',
             '  \__,_/___|',
             '',
-            '  Az',
             '  A small, sane terminal editor for code and text.',
             '',
             '  START',
