@@ -3,8 +3,16 @@
 declare(strict_types=1);
 
 /*
- * az, a sane & powerful cli text editor
- * Run: chmod +x az && az [file-or-folder]
+ *   __ _ ____
+ *  / _` |_  /
+ * | (_| |/ /
+ *  \__,_/___|
+ *
+ * A sane & powerful cli text editor.
+ * by Araz Gholami | https://arazgholami.com
+ * Star it on Github: https://github.com/arazgholami/az
+ *
+ *
  */
 
 final class AzTab
@@ -19,6 +27,7 @@ final class AzTab
     public bool $modified = false;
     public int $revision = 0;
     public int $savedRevision = 0;
+    public ?string $syntaxMode = null;
     /** @var array<int,array{lines:array<int,string>,cursorLine:int,cursorCol:int,rowOffset:int,colOffset:int,revision:int}> */
     public array $undoStack = [];
     /** @var array<int,array{lines:array<int,string>,cursorLine:int,cursorCol:int,rowOffset:int,colOffset:int,revision:int}> */
@@ -36,6 +45,25 @@ final class AzTab
 final class Az
 {
     private const PASTE_PREFIX = "\0AZPASTE:";
+    private const TN_BG = '#1a1b26';
+    private const TN_BG_DARK = '#16161e';
+    private const TN_BG_FLOAT = '#1f2335';
+    private const TN_BG_HIGHLIGHT = '#292e42';
+    private const TN_FG = '#c0caf5';
+    private const TN_FG_DARK = '#a9b1d6';
+    private const TN_GUTTER = '#3b4261';
+    private const TN_COMMENT = '#565f89';
+    private const TN_BLUE = '#7aa2f7';
+    private const TN_CYAN = '#7dcfff';
+    private const TN_GREEN = '#9ece6a';
+    private const TN_GREEN2 = '#73daca';
+    private const TN_MAGENTA = '#bb9af7';
+    private const TN_PURPLE = '#9d7cd8';
+    private const TN_ORANGE = '#ff9e64';
+    private const TN_YELLOW = '#e0af68';
+    private const TN_RED = '#f7768e';
+    private const TN_ACCENT = '#7aa2f7';
+    private const TN_ACCENT_ALT = '#bb9af7';
 
     private string $root;
     /** @var AzTab[] */
@@ -120,17 +148,31 @@ final class Az
             $this->showWelcome = false;
         }
 
+        $needsRender = true;
+        $nextClockRefresh = $this->nextClockRefreshTime();
+
         try {
             while ($this->running) {
-                $this->render();
+                if ($needsRender || time() >= $nextClockRefresh) {
+                    $this->render();
+                    $needsRender = false;
+                    $nextClockRefresh = $this->nextClockRefreshTime();
+                }
+
                 $key = $this->readKey();
                 if ($key !== '') {
                     $this->handleKey($key);
+                    $needsRender = true;
                 }
             }
         } finally {
             $this->cleanup();
         }
+    }
+
+    private function nextClockRefreshTime(): int
+    {
+        return time() + max(1, 61 - (int) date('s'));
     }
 
     private function enableRawMode(): void
@@ -162,13 +204,16 @@ final class Az
             ' | (_| |/ / ',
             '  \__,_/___|',
             '',
-            '  A sane & powerful cli text editor.',
+            '  Az',
+            '  A small, sane terminal editor for code and text.',
             '',
-            '  USAGE  az [file]  |  az [directory]  |  az',
+            '  START',
+            '    az file.php       open a file',
+            '    az project/       open a folder',
             '',
+            '  ESSENTIALS',
         ], $this->shortcutHelpLines(), [
             '',
-            '  SYNTAX  PHP  Blade  HTML  CSS',
             '  Press any key to continue ...',
         ]);
 
@@ -181,19 +226,18 @@ final class Az
     private function shortcutHelpLines(): array
     {
         return [
-            '  EDITING                         NAVIGATION',
-            '    Ctrl+S  Save                  Ctrl+O  Quick open file/symbol',
-            '    Ctrl+Z  Undo                  Ctrl+Y  Redo',
-            '    Ctrl+P  Command palette       Ctrl+G  Go to line',
-            '    Ctrl+W  Remove line           Ctrl+T  Show/focus tree',
-            '    Ctrl+F  Find                  Ctrl+H  Hide/show tree',
-            '    Ctrl+R  Replace               Alt+1-9 Switch tab',
-            '    Tab     Complete              Ctrl+D  Close tab',
-            '    %term   Find/replace ignoring case',
-            '    Ctrl+C  Copy                  Ctrl+/  Welcome',
-            '    Ctrl+X  Cut                   Ctrl+Q  Quit',
-            '    Ctrl+V  Paste                 Ctrl+A  Select all',
-            '    Ctrl+O  file:line or :line',
+            '    Ctrl+S  Save                   Ctrl+O  Quick open file/symbol',
+            '    Ctrl+Z  Undo                   Ctrl+Y  Redo',
+            '    Ctrl+P  Command palette        Ctrl+G  Go to line',
+            '    Ctrl+W  Remove line            Ctrl+T  Show/focus tree',
+            '    Ctrl+F  Find                   Ctrl+H  Hide/show tree',
+            '    Ctrl+R  Replace                Alt+1-9 Switch tab',
+            '    Tab     Complete               Ctrl+D  Close tab',
+            '    %term   Case-sensitive find    Ctrl+/  Help',
+            '    Ctrl+C  Copy                   Ctrl+Q  Quit',
+            '    Ctrl+X  Cut                    Ctrl+A  Select all',
+            '    Ctrl+V  Paste                  Ctrl+O  file:line or :line',
+            '    Ctrl+P  set php/html/css/blade/plain',
         ];
     }
 
@@ -220,8 +264,9 @@ final class Az
         $startCol = max(1, (int) floor(($this->cols - $boxW) / 2));
         $inner = $boxW - 2;
 
+        $border = $this->ansiStyle(self::TN_BLUE, self::TN_BG_FLOAT, true);
         $out = "\033[?25l";
-        $out .= "\033[{$startRow};{$startCol}H\033[1;36m╔" . str_repeat('═', $inner) . "╗\033[0m";
+        $out .= "\033[{$startRow};{$startCol}H" . $border . '╔' . str_repeat('═', $inner) . "╗\033[0m";
 
         foreach ($lines as $idx => $text) {
             $r = $startRow + 1 + $idx;
@@ -229,37 +274,39 @@ final class Az
                 break;
             }
             $cell = $this->stylePopupLine($text, isset($logoLineIndexes[$idx]));
-            $cell = $this->fitAnsi(' ' . $cell, $inner);
-            $out .= "\033[{$r};{$startCol}H\033[1;36m║\033[0m" . $cell . "\033[1;36m║\033[0m";
+            $popupBg = $this->ansiBg(self::TN_BG_FLOAT);
+            $cell = str_replace("\033[0m", "\033[0m" . $popupBg, $cell);
+            $cell = $popupBg . $this->fitAnsi(' ' . $cell, $inner) . "\033[0m";
+            $out .= "\033[{$r};{$startCol}H" . $border . "║\033[0m" . $cell . $border . "║\033[0m";
         }
 
         $br = min($this->rows, $startRow + 1 + count($lines));
-        $out .= "\033[{$br};{$startCol}H\033[1;36m╚" . str_repeat('═', $inner) . "╝\033[0m";
+        $out .= "\033[{$br};{$startCol}H" . $border . '╚' . str_repeat('═', $inner) . "╝\033[0m";
         fwrite(STDOUT, $out);
     }
 
     private function stylePopupLine(string $text, bool $logo = false): string
     {
         if ($logo) {
-            return "\033[38;5;208m\033[1m" . $text . "\033[0m";
+            return $this->ansiStyle(self::TN_ACCENT, null, true) . $text . "\033[0m";
         }
 
         $trim = trim($text);
-        if ($trim === 'KEYBOARD SHORTCUTS' || $trim === 'EDITING                         NAVIGATION' || str_starts_with($trim, 'USAGE') || str_starts_with($trim, 'SYNTAX')) {
-            return "\033[1;36m" . $this->highlightShortcutTokens($text) . "\033[0m";
+        if ($trim === 'KEYBOARD SHORTCUTS' || $trim === 'ESSENTIALS' || str_starts_with($trim, 'START') || str_starts_with($trim, 'USAGE')) {
+            return $this->ansiStyle(self::TN_CYAN, null, true) . $this->highlightShortcutTokens($text) . "\033[0m";
         }
 
         if (str_contains($text, 'Press any key')) {
-            return "\033[2;37m" . $text . "\033[0m";
+            return $this->ansiStyle(self::TN_COMMENT, null, false, true) . $text . "\033[0m";
         }
 
-        return $this->highlightShortcutTokens($text);
+        return $this->ansiFg(self::TN_FG) . $this->highlightShortcutTokens($text) . "\033[0m";
     }
 
     private function highlightShortcutTokens(string $text): string
     {
-        return preg_replace_callback('/Ctrl\+(?:Left\/Right|[A-Z0-9\/])|Alt\+1(?:\.\.9|-9)/', function (array $m): string {
-            return "\033[47m\033[30m" . $m[0] . "\033[0m";
+        return preg_replace_callback('/Ctrl\+(?:Left\/Right|[A-Z0-9\/])|Alt\+1(?:\.\.9|-9)|%term|Tab|file:line|:line/', function (array $m): string {
+            return $this->ansiStyle(self::TN_BG_DARK, self::TN_ACCENT, true) . $m[0] . "\033[0m" . $this->ansiFg(self::TN_FG);
         }, $text) ?? $text;
     }
 
@@ -803,12 +850,15 @@ final class Az
 
         $title = ' Quick Open ';
         $queryLine = ($query === '' ? 'type file, symbol, file:line, or :line' : $query);
+        $border = $this->ansiStyle(self::TN_BLUE, self::TN_BG_FLOAT, true);
+        $titleStyle = $this->ansiStyle(self::TN_ACCENT, self::TN_BG_FLOAT, true);
+        $queryStyle = $this->ansiStyle(self::TN_FG, self::TN_BG_HIGHLIGHT);
 
         $out = "\033[?25l";
-        $out .= "\033[{$startRow};{$startCol}H\033[1;36m╔" . str_repeat('═', $inner) . "╗\033[0m";
-        $out .= "\033[" . ($startRow + 1) . ";{$startCol}H\033[1;36m║\033[0m\033[48;5;24m\033[37m" . $this->fitPlain($title, $inner) . "\033[0m\033[1;36m║\033[0m";
-        $out .= "\033[" . ($startRow + 2) . ";{$startCol}H\033[1;36m║\033[0m\033[48;5;236m\033[37m" . $this->fitPlain($queryLine, $inner) . "\033[0m\033[1;36m║\033[0m";
-        $out .= "\033[" . ($startRow + 3) . ";{$startCol}H\033[1;36m╠" . str_repeat('═', $inner) . "╣\033[0m";
+        $out .= "\033[{$startRow};{$startCol}H" . $border . '╔' . str_repeat('═', $inner) . "╗\033[0m";
+        $out .= "\033[" . ($startRow + 1) . ";{$startCol}H" . $border . "║\033[0m" . $titleStyle . $this->fitPlain($title, $inner) . "\033[0m" . $border . "║\033[0m";
+        $out .= "\033[" . ($startRow + 2) . ";{$startCol}H" . $border . "║\033[0m" . $queryStyle . $this->fitPlain($queryLine, $inner) . "\033[0m" . $border . "║\033[0m";
+        $out .= "\033[" . ($startRow + 3) . ";{$startCol}H" . $border . '╠' . str_repeat('═', $inner) . "╣\033[0m";
 
         for ($i = 0; $i < $rows; $i++) {
             $row = $startRow + 4 + $i;
@@ -827,12 +877,12 @@ final class Az
                 $label = preg_match('/^:\d+$/', trim($query)) ? '   Enter to go to line' : '   No matching files or symbols';
             }
             $line = $this->fitPlain($label, $inner);
-            $style = $i === $selected && $match ? "\033[48;5;220m\033[30m" : "\033[48;5;236m\033[37m";
-            $out .= "\033[{$row};{$startCol}H\033[1;36m║\033[0m{$style}{$line}\033[0m\033[1;36m║\033[0m";
+            $style = $i === $selected && $match ? $this->ansiStyle(self::TN_BG_DARK, self::TN_ACCENT, true) : $this->ansiStyle(self::TN_FG, self::TN_BG_FLOAT);
+            $out .= "\033[{$row};{$startCol}H" . $border . "║\033[0m" . $style . $line . "\033[0m" . $border . "║\033[0m";
         }
 
         $bottom = $startRow + $panelHeight - 1;
-        $out .= "\033[{$bottom};{$startCol}H\033[1;36m╚" . str_repeat('═', $inner) . "╝\033[0m";
+        $out .= "\033[{$bottom};{$startCol}H" . $border . '╚' . str_repeat('═', $inner) . "╝\033[0m";
         fwrite(STDOUT, $out);
     }
 
@@ -955,8 +1005,12 @@ final class Az
         if ($key === "\033") { $this->closeAutocomplete(); $this->clearSelection(); $this->message = 'Selection cleared'; return; }
 
         if ($this->isPrintable($key)) {
+            if (($key === '(' || $key === '{') && $this->insertAutoClosedPair($key)) {
+                $this->refreshAutocomplete();
+                return;
+            }
             $this->insertText($key);
-            if ($key !== "\t") {
+            if ($key !== "	") {
                 $this->refreshAutocomplete();
             }
         }
@@ -970,7 +1024,7 @@ final class Az
         $this->ensureEditorVisible();
         $this->ensureTreeVisible();
 
-        $out = "\033[?25l\033[H";
+        $out = "\033[?25l\033[H" . $this->ansiBg(self::TN_BG) . $this->ansiFg(self::TN_FG);
         $out .= $this->renderTopbar();
         $out .= $this->renderContent();
         $out .= $this->renderStatusLine();
@@ -1000,7 +1054,7 @@ final class Az
 
     private function topbarStyle(): string
     {
-        return "\033[48;5;208m\033[30m\033[1m";
+        return $this->ansiStyle(self::TN_ACCENT, self::TN_BG_FLOAT, true);
     }
 
     private function renderTopbarLine(): string
@@ -1038,10 +1092,10 @@ final class Az
 
             if ($tabIndex === $this->tabIndex) {
                 $number = $showAltHints ? "\033[4m{$num}\033[24m" : $num;
-                $parts[] = "\033[47m\033[30m {$number}:{$name}{$modified} \033[0m" . $baseStyle;
+                $parts[] = $this->ansiStyle(self::TN_BG_DARK, self::TN_ACCENT, true) . " {$number}:{$name}{$modified} \033[0m" . $baseStyle;
             } else {
-                $number = $showAltHints ? "\033[38;5;208m\033[4m{$num}\033[24m\033[30m" : $num;
-                $parts[] = " {$number}:{$name}{$modified} ";
+                $number = $showAltHints ? $this->ansiStyle(self::TN_ACCENT, self::TN_BG_FLOAT, false, false, true) . $num . "\033[24m" . $baseStyle : $num;
+                $parts[] = $this->ansiStyle(self::TN_FG_DARK, self::TN_BG_FLOAT) . " {$number}:{$name}{$modified} " . $baseStyle;
             }
         }
 
@@ -1079,7 +1133,7 @@ final class Az
     {
         $out = '';
         $tab = $this->tab();
-        $syntax = $this->syntaxForPath($tab->path);
+        $syntax = $this->currentSyntax();
         $wrappedRows = $this->wrappedRows();
 
         for ($screenLine = 0; $screenLine < $this->contentHeight; $screenLine++) {
@@ -1095,11 +1149,11 @@ final class Az
 
             if (!$this->sidebarHidden) {
                 $treeText = $this->renderTreeLine($screenLine);
-                $out .= $this->fitAnsi($treeText, $this->treeWidth);
-                $out .= "\033[2m│\033[0m";
+                $out .= $this->ansiBg(self::TN_BG_DARK) . $this->fitAnsi($treeText, $this->treeWidth) . "\033[0m";
+                $out .= $this->ansiStyle(self::TN_GUTTER, self::TN_BG_DARK) . '│' . "\033[0m";
             }
 
-            $out .= $this->fitAnsi($editorText, $this->editorWidth);
+            $out .= $this->ansiBg(self::TN_BG) . $this->ansiFg(self::TN_FG) . $this->fitAnsi($editorText, $this->editorWidth) . "\033[0m";
             $out .= "\r\n";
         }
 
@@ -1129,7 +1183,7 @@ final class Az
             $plain = str_pad((string) ($wrapped['line'] + 1), $digits, ' ', STR_PAD_LEFT) . ' │ ';
         }
 
-        return "\033[2m" . $this->fitPlain($plain, $this->lineNumberGutterWidth()) . "\033[0m";
+        return $this->ansiStyle(self::TN_GUTTER, self::TN_BG, false, true) . $this->fitPlain($plain, $this->lineNumberGutterWidth()) . "\033[0m";
     }
 
     private function renderTreeLine(int $screenLine): string
@@ -1137,13 +1191,13 @@ final class Az
         $hints = $this->sidebarShortcutLines();
         $hintStart = max(0, $this->contentHeight - count($hints));
         if ($screenLine >= $hintStart && isset($hints[$screenLine - $hintStart])) {
-            return "[2m" . $this->fitPlain($hints[$screenLine - $hintStart], $this->treeWidth) . "[0m";
+            return $this->ansiStyle(self::TN_COMMENT, self::TN_BG_DARK, false, true) . $this->fitPlain($hints[$screenLine - $hintStart], $this->treeWidth) . "\033[0m";
         }
 
         $index = $this->treeScroll + $screenLine;
         $row = $this->treeRows[$index] ?? null;
         if (!$row) {
-            return str_repeat(' ', $this->treeWidth);
+            return $this->ansiBg(self::TN_BG_DARK) . str_repeat(' ', $this->treeWidth) . "\033[0m";
         }
 
         $text = $this->treePlainText($row);
@@ -1155,15 +1209,20 @@ final class Az
                 break;
             }
         }
-        $style = '';
+        $underline = $isOpen && $row['type'] === 'file';
+        $style = $this->ansiStyle($this->treeFileColor($row), self::TN_BG_DARK, false, false, $underline);
         if ($active && $this->focus === 'tree') {
-            $style = "\033[7m";
+            $style = $this->ansiStyle(self::TN_BG_DARK, self::TN_ACCENT, true, false, $underline);
         } elseif ($row['type'] === 'dir') {
-            $style = "\033[36m";
+            $style = $this->ansiStyle(self::TN_BLUE, self::TN_BG_DARK, true);
         } elseif ($isOpen) {
-            $style = "\033[32m";
+            $style = $this->ansiStyle($this->treeFileColor($row), self::TN_BG_DARK, true, false, true);
         }
-        return $style . $this->escapeControl($text) . "\033[0m";
+
+        // Pad while the tree row background is still active. Otherwise the reset
+        // happens after the filename and the rest of the sidebar line falls back
+        // to the terminal background, creating black strips after short names.
+        return $style . $this->fitPlain($this->escapeControl($text), $this->treeWidth) . "[0m";
     }
 
     private function renderEditorLine(string $line, int $lineNo, string $syntax, int $startCol = 0, ?int $endCol = null): string
@@ -1178,7 +1237,6 @@ final class Az
         $endCol = $endCol === null ? $lineLen : $this->clampByteCol($line, min($endCol, $lineLen));
         $visualCol = 0;
         $emitted = 0;
-
         $textWidth = $this->editorTextWidth();
 
         for ($i = $startCol; $i < $endCol && $emitted < $textWidth;) {
@@ -1190,16 +1248,17 @@ final class Az
                 break;
             }
 
-            $color = $this->colorAt($segments, $i);
+            $color = $this->colorAt($segments, $i) ?: $this->ansiFg(self::TN_FG);
             $selected = $selection && $this->positionInRange($lineNo, $i, $selection);
+            $selectionStyle = $this->ansiStyle(self::TN_BG_DARK, self::TN_ACCENT);
 
             if ($char === "\t") {
                 $pad = str_repeat(' ', max(1, min($charWidth, $textWidth - $emitted)));
-                $out .= $selected ? "\033[7m{$pad}\033[0m" : $pad;
+                $out .= $selected ? $selectionStyle . $pad . "\033[0m" : $pad;
             } else {
                 $safeChar = $this->escapeControl($char);
                 $out .= $selected
-                    ? "\033[7m" . $color . $safeChar . "\033[0m"
+                    ? $selectionStyle . $safeChar . "\033[0m"
                     : $color . $safeChar . "\033[0m";
             }
 
@@ -1331,23 +1390,48 @@ final class Az
         return $indent . $marker . $row['name'];
     }
 
+    /**
+     * @param array{path:string,type:string,depth:int,name:string} $row
+     */
+    private function treeFileColor(array $row): string
+    {
+        if ($row['type'] === 'dir') {
+            return self::TN_BLUE;
+        }
+
+        $name = strtolower($row['name']);
+        if (str_ends_with($name, '.blade.php') || str_ends_with($name, '.blade')) {
+            return self::TN_MAGENTA;
+        }
+
+        $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+        return match ($ext) {
+            'php', 'phtml', 'phps' => self::TN_PURPLE,
+            'html', 'htm', 'xml', 'svg' => self::TN_RED,
+            'css', 'scss', 'sass', 'less' => self::TN_BLUE,
+            'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs' => self::TN_YELLOW,
+            'json', 'lock', 'yaml', 'yml', 'toml' => self::TN_GREEN,
+            'md', 'markdown', 'txt', 'org' => self::TN_CYAN,
+            'sh', 'bash', 'zsh', 'fish' => self::TN_GREEN2,
+            'png', 'jpg', 'jpeg', 'gif', 'webp', 'ico' => self::TN_GREEN2,
+            default => self::TN_FG_DARK,
+        };
+    }
+
 
     private function renderStatusLine(): string
     {
-        // Prompt mode: render an orange input bar
         if ($this->message === '__PROMPT__' && $this->promptLabel !== null) {
             $label = $this->promptLabel;
             $value = $this->promptValue ?? '';
-            // " az> " prefix (5 chars) + label (bold) + value (normal) + cursor hint
             $prefix = ' az> ';
             $hint = '  (Enter confirm, Esc cancel, Ctrl+U clear)';
             $left = $prefix . $label . $value;
             $right = $hint;
             $pad = max(0, $this->cols - strlen($left) - strlen($right));
             $text = $this->fitPlain($left . str_repeat(' ', $pad) . $right, $this->cols);
-            // Orange background (color 208 on 256-color, fallback to bold yellow inverse)
-            return "\033[0m\033[48;5;208m\033[30m\033[1m" . substr($text, 0, 5)
-                . "\033[22m\033[1m" . $label . "\033[0m\033[48;5;208m\033[30m" . $value
+            return "\033[0m" . $this->ansiStyle(self::TN_BG_DARK, self::TN_ACCENT, true) . substr($text, 0, 5)
+                . "\033[22m\033[1m" . $label . "\033[0m" . $this->ansiStyle(self::TN_ACCENT, self::TN_BG_DARK) . $value
                 . str_repeat(' ', max(0, $this->cols - strlen($left)))
                 . "\033[0m";
         }
@@ -1359,7 +1443,9 @@ final class Az
         $msg = trim($this->message);
         $help = 'Ctrl+/ Help';
         $tree = $this->sidebarHidden ? 'Tree hidden' : 'Tree shown';
-        $text = " {$focus}  {$path}  {$state}  {$tree}";
+        $syntax = $this->currentSyntax();
+        $syntaxLabel = $tab->syntaxMode !== null ? strtoupper($syntax) . ' manual' : strtoupper($syntax);
+        $text = " {$focus}  {$path}  {$state}  {$syntaxLabel}  {$tree}";
         if ($msg !== '') {
             $text .= "  {$msg}";
         }
@@ -1369,10 +1455,10 @@ final class Az
         $text .= "  {$help}";
 
         if ($this->statusFlash !== null) {
-            return "\033[48;5;208m\033[30m" . $this->fitPlain($text, $this->cols) . "\033[0m";
+            return $this->ansiStyle(self::TN_BG_DARK, self::TN_ACCENT, true) . $this->fitPlain($text, $this->cols) . "\033[0m";
         }
 
-        return "\033[7m" . $this->fitPlain($text, $this->cols) . "\033[0m";
+        return $this->ansiStyle(self::TN_FG, self::TN_BG_HIGHLIGHT) . $this->fitPlain($text, $this->cols) . "\033[0m";
     }
 
     private function refreshTree(): void
@@ -1598,7 +1684,7 @@ final class Az
 
     private function findPrompt(): void
     {
-        $query = $this->prompt('Find (%term ignores case): ', $this->lastFind);
+        $query = $this->prompt('Find (%term case-sensitive): ', $this->lastFind);
         if ($query === '') {
             $this->message = 'Find cancelled';
             return;
@@ -1613,10 +1699,10 @@ final class Az
     private function parseFindQuery(string $query): array
     {
         if (strlen($query) > 1 && $query[0] === '%') {
-            return ['needle' => substr($query, 1), 'ignoreCase' => true];
+            return ['needle' => substr($query, 1), 'ignoreCase' => false];
         }
 
-        return ['needle' => $query, 'ignoreCase' => false];
+        return ['needle' => $query, 'ignoreCase' => true];
     }
 
     private function findMatchPosition(string $line, string $needle, int $offset, bool $ignoreCase): int|false
@@ -1679,19 +1765,19 @@ final class Az
                     $tab->cursorLine = $line;
                     $tab->cursorCol = $pos;
                     $this->selectionAnchor = ['line' => $line, 'col' => $pos + strlen($needle)];
-                    $this->message = 'Found: ' . $needle . ($ignoreCase ? ' (ignore case)' : '');
+                    $this->message = 'Found: ' . $needle . ($ignoreCase ? ' (ignore case)' : ' (case-sensitive)');
                     return true;
                 }
             }
         }
 
-        $this->message = 'Not found: ' . $needle . ($ignoreCase ? ' (ignore case)' : '');
+        $this->message = 'Not found: ' . $needle . ($ignoreCase ? ' (ignore case)' : ' (case-sensitive)');
         return false;
     }
 
     private function replacePrompt(): void
     {
-        $query = $this->prompt('Find (%term ignores case): ', $this->lastFind);
+        $query = $this->prompt('Find (%term case-sensitive): ', $this->lastFind);
         if ($this->promptCancelled || $query === '') {
             $this->message = 'Replace cancelled';
             return;
@@ -1733,7 +1819,7 @@ final class Az
         $tab->cursorCol = $col + strlen($replacement);
         $this->markEdited($tab);
         $this->clearSelection();
-        $this->message = 'Replaced one match' . ($ignoreCase ? ' (ignore case)' : '');
+        $this->message = 'Replaced one match' . ($ignoreCase ? ' (ignore case)' : ' (case-sensitive)');
     }
 
     private function replaceAll(string $query, string $replacement): void
@@ -1758,7 +1844,7 @@ final class Az
             $this->markEdited($tab);
         }
         $this->clearSelection();
-        $this->message = "Replaced {$changed} match" . ($changed === 1 ? '' : 'es') . ($ignoreCase ? ' (ignore case)' : '');
+        $this->message = "Replaced {$changed} match" . ($changed === 1 ? '' : 'es') . ($ignoreCase ? ' (ignore case)' : ' (case-sensitive)');
     }
 
     private function moveCursor(int $lineDelta, int $colDelta, bool $select): void
@@ -1829,6 +1915,31 @@ final class Az
     private function clearSelection(): void
     {
         $this->selectionAnchor = null;
+    }
+
+    private function insertAutoClosedPair(string $open): bool
+    {
+        $pairs = ['(' => ')', '{' => '}'];
+        if (!isset($pairs[$open])) {
+            return false;
+        }
+        $close = $pairs[$open];
+        $this->beginUndoGroup();
+        try {
+            $this->deleteSelectionIfAny();
+            $tab = $this->tab();
+            $line = $tab->lines[$tab->cursorLine];
+            $cursor = $this->clampByteCol($line, $tab->cursorCol);
+            $this->recordUndoState();
+            $tab->lines[$tab->cursorLine] = substr($line, 0, $cursor) . $open . $close . substr($line, $cursor);
+            $tab->cursorCol = $cursor + strlen($open);
+            $this->markEdited($tab);
+            $this->clearSelection();
+            $this->message = 'Closed ' . $open . $close;
+        } finally {
+            $this->endUndoGroup();
+        }
+        return true;
     }
 
     private function insertText(string $text): void
@@ -2330,7 +2441,7 @@ final class Az
     private function autoCloseHtmlTag(): void
     {
         $tab = $this->tab();
-        $syntax = $this->syntaxForPath($tab->path);
+        $syntax = $this->currentSyntax();
         if ($syntax !== 'html' && $syntax !== 'blade') {
             return;
         }
@@ -2461,11 +2572,18 @@ final class Az
             ['label' => 'Delete selected file or folder', 'detail' => 'moves nowhere, asks first', 'action' => 'delete-path'],
             ['label' => 'Go to line', 'detail' => 'Ctrl+G', 'action' => 'go-line'],
             ['label' => 'Search project', 'detail' => 'find text in files', 'action' => 'project-search'],
+            ['label' => 'Set syntax PHP', 'detail' => 'force current tab to PHP', 'action' => 'set-syntax-php'],
+            ['label' => 'Set syntax Blade', 'detail' => 'force current tab to Blade', 'action' => 'set-syntax-blade'],
+            ['label' => 'Set syntax HTML', 'detail' => 'force current tab to HTML', 'action' => 'set-syntax-html'],
+            ['label' => 'Set syntax CSS', 'detail' => 'force current tab to CSS', 'action' => 'set-syntax-css'],
+            ['label' => 'Set syntax Auto', 'detail' => 'use file extension again', 'action' => 'set-syntax-auto'],
+            ['label' => 'Set syntax Plain', 'detail' => 'disable highlighting/completion', 'action' => 'set-syntax-plain'],
             ['label' => 'Find in current file', 'detail' => 'Ctrl+F', 'action' => 'find'],
             ['label' => 'Replace in current file', 'detail' => 'Ctrl+R', 'action' => 'replace'],
             ['label' => 'Toggle sidebar', 'detail' => 'Ctrl+H', 'action' => 'toggle-tree'],
             ['label' => 'Focus tree/editor', 'detail' => 'Ctrl+T', 'action' => 'focus-tree'],
             ['label' => 'Close tab', 'detail' => 'Ctrl+D', 'action' => 'close-tab'],
+            ['label' => 'Demo mode', 'detail' => 'show welcome, command palette, and quick open as tiles', 'action' => 'demo-mode'],
             ['label' => 'Welcome screen', 'detail' => 'Ctrl+/', 'action' => 'help'],
             ['label' => 'Quit', 'detail' => 'Ctrl+Q', 'action' => 'quit'],
         ];
@@ -2475,7 +2593,7 @@ final class Az
     {
         $query = trim($query);
         if ($query === '') {
-            return array_slice($commands, 0, 12);
+            return array_slice($commands, 0, 18);
         }
         $ranked = [];
         foreach ($commands as $command) {
@@ -2508,11 +2626,18 @@ final class Az
             case 'delete-path': $this->deleteTreePathPrompt(true); break;
             case 'go-line': $this->goToLinePrompt(); break;
             case 'project-search': $this->projectSearchPrompt(); break;
+            case 'set-syntax-php': $this->setCurrentSyntax('php'); break;
+            case 'set-syntax-blade': $this->setCurrentSyntax('blade'); break;
+            case 'set-syntax-html': $this->setCurrentSyntax('html'); break;
+            case 'set-syntax-css': $this->setCurrentSyntax('css'); break;
+            case 'set-syntax-plain': $this->setCurrentSyntax('plain'); break;
+            case 'set-syntax-auto': $this->setCurrentSyntax(null); break;
             case 'find': $this->findPrompt(); break;
             case 'replace': $this->replacePrompt(); break;
             case 'toggle-tree': $this->toggleSidebar(); break;
             case 'focus-tree': $this->toggleTreeFocus(); break;
             case 'close-tab': $this->closeCurrentTab(); break;
+            case 'demo-mode': $this->showDemoMode(); break;
             case 'help': $this->showShortcutsHelp(); break;
             case 'quit': $this->confirmQuit(); break;
             default: $this->message = 'Unknown command'; break;
@@ -2528,12 +2653,15 @@ final class Az
         $startCol = max(1, (int) floor(($this->cols - $panelWidth) / 2));
         $startRow = max(2, (int) floor(($this->rows - $panelHeight) / 2));
         $inner = $panelWidth - 2;
+        $border = $this->ansiStyle(self::TN_BLUE, self::TN_BG_FLOAT, true);
+        $titleStyle = $this->ansiStyle(self::TN_ACCENT, self::TN_BG_FLOAT, true);
+        $queryStyle = $this->ansiStyle(self::TN_FG, self::TN_BG_HIGHLIGHT);
 
         $out = "\033[?25l";
-        $out .= "\033[{$startRow};{$startCol}H\033[1;36m╔" . str_repeat('═', $inner) . "╗\033[0m";
-        $out .= "\033[" . ($startRow + 1) . ";{$startCol}H\033[1;36m║\033[0m\033[48;5;24m\033[37m" . $this->fitPlain($title, $inner) . "\033[0m\033[1;36m║\033[0m";
-        $out .= "\033[" . ($startRow + 2) . ";{$startCol}H\033[1;36m║\033[0m\033[48;5;236m\033[37m" . $this->fitPlain($queryLine, $inner) . "\033[0m\033[1;36m║\033[0m";
-        $out .= "\033[" . ($startRow + 3) . ";{$startCol}H\033[1;36m╠" . str_repeat('═', $inner) . "╣\033[0m";
+        $out .= "\033[{$startRow};{$startCol}H" . $border . '╔' . str_repeat('═', $inner) . "╗\033[0m";
+        $out .= "\033[" . ($startRow + 1) . ";{$startCol}H" . $border . "║\033[0m" . $titleStyle . $this->fitPlain($title, $inner) . "\033[0m" . $border . "║\033[0m";
+        $out .= "\033[" . ($startRow + 2) . ";{$startCol}H" . $border . "║\033[0m" . $queryStyle . $this->fitPlain($queryLine, $inner) . "\033[0m" . $border . "║\033[0m";
+        $out .= "\033[" . ($startRow + 3) . ";{$startCol}H" . $border . '╠' . str_repeat('═', $inner) . "╣\033[0m";
 
         for ($i = 0; $i < $rows; $i++) {
             $row = $startRow + 4 + $i;
@@ -2549,12 +2677,137 @@ final class Az
             } elseif (!$matches && $i === 0) {
                 $text = '   ' . $empty;
             }
-            $style = $i === $selected && $match ? "\033[48;5;220m\033[30m" : "\033[48;5;236m\033[37m";
-            $out .= "\033[{$row};{$startCol}H\033[1;36m║\033[0m{$style}" . $this->fitPlain($text, $inner) . "\033[0m\033[1;36m║\033[0m";
+            $style = $i === $selected && $match ? $this->ansiStyle(self::TN_BG_DARK, self::TN_ACCENT, true) : $this->ansiStyle(self::TN_FG, self::TN_BG_FLOAT);
+            $out .= "\033[{$row};{$startCol}H" . $border . "║\033[0m" . $style . $this->fitPlain($text, $inner) . "\033[0m" . $border . "║\033[0m";
         }
 
         $bottom = $startRow + $panelHeight - 1;
-        $out .= "\033[{$bottom};{$startCol}H\033[1;36m╚" . str_repeat('═', $inner) . "╝\033[0m";
+        $out .= "\033[{$bottom};{$startCol}H" . $border . '╚' . str_repeat('═', $inner) . "╝\033[0m";
+        fwrite(STDOUT, $out);
+    }
+
+    private function showDemoMode(): void
+    {
+        $oldMessage = $this->message;
+        $this->message = 'Demo mode. Press any key to close';
+        $this->render();
+        $this->message = $oldMessage;
+        $this->readTerminalSize();
+
+        $footer = ' Demo mode: welcome, command palette, and quick open. Press any key to return. ';
+        $minTileWidth = 34;
+        $gap = 2;
+        $availableWidth = max(1, $this->cols - 4);
+        $sideBySide = $this->cols >= ($minTileWidth * 3 + $gap * 2 + 4);
+        $twoByOne = !$sideBySide && $this->cols >= ($minTileWidth * 2 + $gap + 4) && $this->rows >= 28;
+
+        $welcomeLines = [
+            '   __ _ ____',
+            '  / _` |_  /',
+            ' | (_| |/ / ',
+            '  \__,_/___|',
+            '',
+            'A small, sane terminal editor.',
+            '',
+            'Ctrl+O  Quick open',
+            'Ctrl+P  Command palette',
+            'Ctrl+T  Tree/editor',
+            'Ctrl+F  Find ignores case by default',
+            '%term   Case-sensitive find',
+            'Ctrl+S  Save',
+        ];
+        $commandLines = [
+            'type a command',
+            '----------------',
+            '› Demo mode              screenshot tiles',
+            '  Save                   Ctrl+S',
+            '  Set syntax PHP         force current tab',
+            '  Set syntax HTML        force current tab',
+            '  Project search         find text in files',
+            '  Welcome screen         Ctrl+/',
+        ];
+        $quickOpenLines = [
+            'type file, symbol, file:line, or :line',
+            '----------------',
+            '› az:3729                file',
+            '  README.md              file',
+            '  main.blade.php:20      file line',
+            '  ƒ renderQuickOpen      symbol',
+            '  ƒ commandPalette       symbol',
+            '  :120                   current file line',
+        ];
+
+        if ($sideBySide) {
+            $tileWidth = max($minTileWidth, intdiv($availableWidth - ($gap * 2), 3));
+            $tileHeight = max(12, min($this->rows - 6, 18));
+            $top = max(2, intdiv($this->rows - $tileHeight, 2));
+            $left = max(2, intdiv($this->cols - ($tileWidth * 3 + $gap * 2), 2));
+            $this->renderDemoTile($top, $left, $tileWidth, $tileHeight, ' Welcome ', $welcomeLines, null, [0, 1, 2, 3]);
+            $this->renderDemoTile($top, $left + $tileWidth + $gap, $tileWidth, $tileHeight, ' Command Palette ', $commandLines, 2);
+            $this->renderDemoTile($top, $left + ($tileWidth + $gap) * 2, $tileWidth, $tileHeight, ' Quick Open ', $quickOpenLines, 2);
+        } elseif ($twoByOne) {
+            $tileWidth = max($minTileWidth, intdiv($availableWidth - $gap, 2));
+            $tileHeight = max(10, min(16, intdiv($this->rows - 7, 2)));
+            $left = max(2, intdiv($this->cols - ($tileWidth * 2 + $gap), 2));
+            $top = max(2, intdiv($this->rows - ($tileHeight * 2 + $gap), 2));
+            $this->renderDemoTile($top, $left, $tileWidth, $tileHeight, ' Welcome ', $welcomeLines, null, [0, 1, 2, 3]);
+            $this->renderDemoTile($top, $left + $tileWidth + $gap, $tileWidth, $tileHeight, ' Command Palette ', $commandLines, 2);
+            $this->renderDemoTile($top + $tileHeight + $gap, $left, $tileWidth * 2 + $gap, $tileHeight, ' Quick Open ', $quickOpenLines, 2);
+        } else {
+            $tileWidth = max(28, min($availableWidth, $this->cols - 4));
+            $tileHeight = max(8, intdiv(max(12, $this->rows - 6), 3));
+            $left = max(2, intdiv($this->cols - $tileWidth, 2));
+            $top = 2;
+            $this->renderDemoTile($top, $left, $tileWidth, $tileHeight, ' Welcome ', $welcomeLines, null, [0, 1, 2, 3]);
+            $this->renderDemoTile($top + $tileHeight, $left, $tileWidth, $tileHeight, ' Command Palette ', $commandLines, 2);
+            $this->renderDemoTile($top + ($tileHeight * 2), $left, $tileWidth, $tileHeight, ' Quick Open ', $quickOpenLines, 2);
+        }
+
+        $row = max(1, $this->rows);
+        $col = max(1, intdiv(max(0, $this->cols - $this->visualWidth($footer)), 2));
+        fwrite(STDOUT, "\033[{$row};{$col}H" . $this->ansiStyle(self::TN_FG, self::TN_BG_DARK, true) . $this->fitPlain($footer, min($this->cols, $this->visualWidth($footer))) . "\033[0m");
+        $this->waitForKey();
+        $this->message = 'Demo mode closed';
+    }
+
+    /**
+     * @param string[] $lines
+     * @param int[] $logoLineIndexes
+     */
+    private function renderDemoTile(int $startRow, int $startCol, int $width, int $height, string $title, array $lines, ?int $selected = null, array $logoLineIndexes = []): void
+    {
+        $width = max(12, min($width, $this->cols - $startCol + 1));
+        $height = max(5, min($height, $this->rows - $startRow));
+        $inner = max(1, $width - 2);
+        $border = $this->ansiStyle(self::TN_BLUE, self::TN_BG_FLOAT, true);
+        $titleStyle = $this->ansiStyle(self::TN_ACCENT, self::TN_BG_FLOAT, true);
+        $plainStyle = $this->ansiStyle(self::TN_FG, self::TN_BG_FLOAT);
+        $selectedStyle = $this->ansiStyle(self::TN_BG_DARK, self::TN_ACCENT, true);
+        $mutedStyle = $this->ansiStyle(self::TN_COMMENT, self::TN_BG_FLOAT, false, true);
+
+        $out = '';
+        $out .= "\033[{$startRow};{$startCol}H" . $border . '╔' . str_repeat('═', $inner) . "╗\033[0m";
+        $out .= "\033[" . ($startRow + 1) . ";{$startCol}H" . $border . "║\033[0m" . $titleStyle . $this->fitPlain($title, $inner) . "\033[0m" . $border . "║\033[0m";
+        $out .= "\033[" . ($startRow + 2) . ";{$startCol}H" . $border . '╠' . str_repeat('═', $inner) . "╣\033[0m";
+
+        $bodyRows = max(1, $height - 4);
+        for ($i = 0; $i < $bodyRows; $i++) {
+            $row = $startRow + 3 + $i;
+            $text = $lines[$i] ?? '';
+            if (in_array($i, $logoLineIndexes, true)) {
+                $cell = $this->ansiStyle(self::TN_ACCENT, self::TN_BG_FLOAT, true) . $this->fitPlain($text, $inner) . "\033[0m";
+            } elseif ($text === '----------------') {
+                $cell = $mutedStyle . $this->fitPlain(str_repeat('─', $inner), $inner) . "\033[0m";
+            } elseif ($selected !== null && $i === $selected) {
+                $cell = $selectedStyle . $this->fitPlain($text, $inner) . "\033[0m";
+            } else {
+                $cell = $plainStyle . $this->fitPlain($text, $inner) . "\033[0m";
+            }
+            $out .= "\033[{$row};{$startCol}H" . $border . "║\033[0m" . $cell . $border . "║\033[0m";
+        }
+
+        $bottom = $startRow + $height - 1;
+        $out .= "\033[{$bottom};{$startCol}H" . $border . '╚' . str_repeat('═', $inner) . "╝\033[0m";
         fwrite(STDOUT, $out);
     }
 
@@ -3017,6 +3270,8 @@ final class Az
             }
             $lines = explode("\n", str_replace(["\r\n", "\r"], "\n", $contents));
             $tab = new AzTab($item['path'], $lines);
+            $syntaxMode = $item['syntaxMode'] ?? null;
+            $tab->syntaxMode = is_string($syntaxMode) && in_array($syntaxMode, $this->supportedSyntaxModes(), true) ? $syntaxMode : null;
             $tab->cursorLine = max(0, min((int) ($item['cursorLine'] ?? 0), count($tab->lines) - 1));
             $tab->cursorCol = $this->clampByteCol($tab->lines[$tab->cursorLine], (int) ($item['cursorCol'] ?? 0));
             $tab->rowOffset = max(0, (int) ($item['rowOffset'] ?? 0));
@@ -3051,6 +3306,7 @@ final class Az
                 'cursorLine' => $tab->cursorLine,
                 'cursorCol' => $tab->cursorCol,
                 'rowOffset' => $tab->rowOffset,
+                'syntaxMode' => $tab->syntaxMode,
             ];
         }
         $data = [
@@ -3074,7 +3330,7 @@ final class Az
         $value = $default;
         while (true) {
             // Render the full editor frame, but override the status bar
-            // with an orange-highlighted input field so the user clearly sees
+            // with an Tokyo Night highlighted input field so the user clearly sees
             // where they are typing.
             $this->message = '__PROMPT__';  // sentinel; renderStatusLine checks this
             $this->promptLabel = $label;
@@ -3082,7 +3338,7 @@ final class Az
             $this->render();
             $this->message = '';
 
-            // Position cursor right after the label inside the orange input area.
+            // Position cursor right after the label inside the highlighted input area.
             // The prompt bar is rendered on the bottom status row.
             // It starts with " az> " (5 chars) then the label, then the value.
             $statusRow = $this->statusLine;
@@ -3313,7 +3569,7 @@ final class Az
     private function autocompleteContext(bool $explicit = false): ?array
     {
         $tab = $this->tab();
-        $syntax = $this->syntaxForPath($tab->path);
+        $syntax = $this->currentSyntax();
         $line = $tab->lines[$tab->cursorLine] ?? '';
         $cursor = $this->clampByteCol($line, $tab->cursorCol);
         $before = substr($line, 0, $cursor);
@@ -3340,13 +3596,22 @@ final class Az
         }
 
         if ($syntax === 'css' || $this->looksLikeCssContext($syntax, $before)) {
-            if (preg_match('/(@?[A-Za-z_-][A-Za-z0-9_-]*)$/u', $before, $m, PREG_OFFSET_CAPTURE)) {
+            if (preg_match('/(@[A-Za-z_-][A-Za-z0-9_-]*)$/u', $before, $m, PREG_OFFSET_CAPTURE)) {
                 $prefix = $m[1][0];
-                return ['mode' => str_starts_with($prefix, '@') ? 'css-at-rule' : 'css', 'prefix' => $prefix, 'start' => $cursor - strlen($prefix)];
+                return ['mode' => 'css-at-rule', 'prefix' => $prefix, 'start' => $cursor - strlen($prefix)];
+            }
+            if (preg_match('/([A-Za-z_-][A-Za-z0-9_-]*)$/u', $before, $m, PREG_OFFSET_CAPTURE)) {
+                $prefix = $m[1][0];
+                $mode = $this->looksLikeCssValuePosition($before) ? 'css-value' : 'css-property';
+                return ['mode' => $mode, 'prefix' => $prefix, 'start' => $cursor - strlen($prefix)];
             }
         }
 
         if ($syntax === 'php' || $syntax === 'blade') {
+            if (preg_match('/(?:->|::)([A-Za-z_][A-Za-z0-9_]*)$/u', $before, $m, PREG_OFFSET_CAPTURE)) {
+                $prefix = $m[1][0];
+                return ['mode' => 'php-member', 'prefix' => $prefix, 'start' => $cursor - strlen($prefix)];
+            }
             if (preg_match('/(\$[A-Za-z_][A-Za-z0-9_]*)$/u', $before, $m, PREG_OFFSET_CAPTURE)) {
                 $prefix = $m[1][0];
                 return ['mode' => 'php-variable', 'prefix' => $prefix, 'start' => $cursor - strlen($prefix)];
@@ -3378,6 +3643,18 @@ final class Az
         return strripos($before, 'style="') !== false || strripos($before, "style='") !== false;
     }
 
+    private function looksLikeCssValuePosition(string $before): bool
+    {
+        $tail = preg_replace('/.*[;{}]/s', '', $before) ?? $before;
+        $colon = strrpos($tail, ':');
+        if ($colon === false) {
+            return false;
+        }
+        $lastOpenParen = strrpos($tail, '(');
+        $lastCloseParen = strrpos($tail, ')');
+        return $lastOpenParen === false || ($lastCloseParen !== false && $lastCloseParen > $lastOpenParen) || $colon > $lastOpenParen;
+    }
+
     private function autocompleteSuggestionsForContext(array $context): array
     {
         $mode = (string) $context['mode'];
@@ -3392,8 +3669,11 @@ final class Az
         if ($mode === 'css-at-rule') {
             return $this->filterAutocompleteItems($this->cssAutocompleteAtRules(), $prefix, 'at-rule');
         }
-        if ($mode === 'css') {
-            return $this->filterAutocompleteItems(array_merge($this->cssAutocompleteProperties(), $this->cssAutocompleteValues()), $prefix, 'css');
+        if ($mode === 'css-property') {
+            return $this->filterAutocompleteItems($this->cssAutocompleteProperties(), $prefix, 'property');
+        }
+        if ($mode === 'css-value') {
+            return $this->filterAutocompleteItems(array_merge($this->cssAutocompleteValues(), $this->cssAutocompleteFunctions()), $prefix, 'value');
         }
         if ($mode === 'blade-directive') {
             return $this->filterAutocompleteItems($this->bladeAutocompleteDirectives(), $prefix, 'blade');
@@ -3401,8 +3681,11 @@ final class Az
         if ($mode === 'php-variable') {
             return $this->filterAutocompleteItems($this->phpAutocompleteVariables(), $prefix, 'variable');
         }
+        if ($mode === 'php-member') {
+            return $this->filterAutocompleteItems(array_merge($this->phpAutocompleteMembers(), $this->phpAutocompleteSymbols()), $prefix, 'member');
+        }
         if ($mode === 'php') {
-            return $this->filterAutocompleteItems(array_merge($this->phpAutocompleteKeywords(), $this->phpAutocompleteFunctions(), $this->phpAutocompleteSymbols()), $prefix, 'php');
+            return $this->filterAutocompleteItems(array_merge($this->phpAutocompleteKeywords(), $this->phpAutocompleteFunctions(), $this->phpAutocompleteConstants(), $this->phpAutocompleteSymbols()), $prefix, 'php');
         }
 
         return [];
@@ -3425,7 +3708,8 @@ final class Az
                 continue;
             }
 
-            if ($prefixLower !== '' && !str_starts_with(strtolower($label), $prefixLower) && !str_starts_with(strtolower($insert), $prefixLower)) {
+            $haystack = strtolower($label . ' ' . $insert . ' ' . (string) ($item['detail'] ?? ''));
+            if ($prefixLower !== '' && !str_starts_with(strtolower($label), $prefixLower) && !str_starts_with(strtolower($insert), $prefixLower) && !str_contains($haystack, $prefixLower)) {
                 continue;
             }
             if ($insert === $prefix) {
@@ -3437,27 +3721,42 @@ final class Az
                 continue;
             }
             $seen[$key] = true;
+            $rank = 20;
+            if ($prefixLower === '') {
+                $rank = 10;
+            } elseif (strtolower($label) === $prefixLower || strtolower($insert) === $prefixLower) {
+                $rank = 0;
+            } elseif (str_starts_with(strtolower($label), $prefixLower) || str_starts_with(strtolower($insert), $prefixLower)) {
+                $rank = 1;
+            } elseif (str_contains($haystack, $prefixLower)) {
+                $rank = 2;
+            }
             $out[] = [
                 'label' => $label,
                 'insert' => $insert,
                 'detail' => (string) ($item['detail'] ?? $defaultType),
                 'type' => (string) ($item['type'] ?? $defaultType),
+                'rank' => $rank,
             ];
-            if (count($out) >= 60) {
+            if (count($out) >= 120) {
                 break;
             }
         }
 
-        usort($out, function (array $a, array $b) use ($prefixLower): int {
-            $aExact = strtolower($a['label']) === $prefixLower || strtolower($a['insert']) === $prefixLower;
-            $bExact = strtolower($b['label']) === $prefixLower || strtolower($b['insert']) === $prefixLower;
-            if ($aExact !== $bExact) {
-                return $aExact ? -1 : 1;
+        usort($out, function (array $a, array $b): int {
+            if ($a['rank'] !== $b['rank']) {
+                return $a['rank'] <=> $b['rank'];
+            }
+            if ($a['type'] !== $b['type']) {
+                return strcmp($a['type'], $b['type']);
             }
             return strcasecmp($a['label'], $b['label']);
         });
 
-        return $out;
+        return array_map(function (array $item): array {
+            unset($item['rank']);
+            return $item;
+        }, $out);
     }
 
     private function renderAutocompleteDropdown(int $cursorRow, int $cursorCol): string
@@ -3467,17 +3766,21 @@ final class Az
         }
 
         $count = count($this->autocompleteSuggestions);
-        $maxItems = min(8, $count);
-        $first = max(0, min($this->autocompleteIndex - 3, $count - $maxItems));
+        $maxItems = min(10, $count);
+        $first = max(0, min($this->autocompleteIndex - 4, $count - $maxItems));
         $visible = array_slice($this->autocompleteSuggestions, $first, $maxItems, true);
 
-        $width = 18;
+        $width = 30;
         foreach ($visible as $item) {
-            $width = max($width, $this->visualWidth($item['label'] . '  ' . $item['detail']) + 2);
+            $width = max($width, $this->visualWidth($item['label'] . '  ' . $item['detail']) + 4);
         }
-        $width = min(max(18, $width), min(48, $this->editorWidth));
+        $maxWidth = max(30, min($this->cols - 2, max(58, $this->editorWidth + 12)));
+        $width = min(max(30, $width), $maxWidth);
 
-        $startCol = max($this->editorStartCol(), min($cursorCol, $this->cols - $width + 1));
+        $startCol = max(1, min($cursorCol, $this->cols - $width + 1));
+        if (!$this->sidebarHidden) {
+            $startCol = max($this->editorStartCol(), $startCol);
+        }
         $startRow = $cursorRow + 1;
         if ($startRow + $maxItems > $this->statusLine) {
             $startRow = max(2, $cursorRow - $maxItems);
@@ -3489,11 +3792,14 @@ final class Az
             if ($row >= $this->statusLine) {
                 break;
             }
-            $labelWidth = max(1, $width - 13);
+            $detailWidth = min(20, max(10, (int) floor($width * 0.28)));
+            $labelWidth = max(8, $width - $detailWidth - 4);
             $label = $this->truncatePlain($item['label'], $labelWidth);
-            $detail = $this->truncatePlain($item['detail'], 10);
+            $detail = $this->truncatePlain($item['detail'], $detailWidth);
             $text = ' ' . $label . str_repeat(' ', max(1, $width - $this->visualWidth($label) - $this->visualWidth($detail) - 2)) . $detail . ' ';
-            $style = ($idx === $this->autocompleteIndex) ? "\033[48;5;208m\033[30m" : "\033[48;5;236m\033[37m";
+            $style = ($idx === $this->autocompleteIndex)
+                ? $this->ansiStyle(self::TN_BG_DARK, self::TN_ACCENT, true)
+                : $this->ansiStyle(self::TN_FG, self::TN_BG_FLOAT);
             $out .= "\033[{$row};{$startCol}H" . $style . $this->fitPlain($text, $width) . "\033[0m";
             $row++;
         }
@@ -3508,7 +3814,7 @@ final class Az
 
     private function htmlAutocompleteAttributes(): array
     {
-        return ['accept','action','alt','aria-label','async','autocomplete','autofocus','checked','class','cols','colspan','content','contenteditable','data-','defer','disabled','download','draggable','enctype','for','height','hidden','href','id','lang','loading','max','maxlength','method','min','multiple','name','pattern','placeholder','rel','required','role','rows','rowspan','selected','src','style','tabindex','target','title','type','value','width'];
+        return ['accept','accept-charset','accesskey','action','allow','alt','aria-','aria-label','aria-hidden','aria-expanded','aria-controls','async','autocomplete','autofocus','autoplay','charset','checked','cite','class','cols','colspan','content','contenteditable','controls','crossorigin','data-','datetime','defer','dir','disabled','download','draggable','enctype','for','form','height','hidden','href','hreflang','id','integrity','lang','loading','loop','max','maxlength','media','method','min','minlength','multiple','muted','name','novalidate','pattern','placeholder','poster','preload','readonly','rel','required','role','rows','rowspan','sandbox','scope','selected','sizes','slot','spellcheck','src','srcset','style','tabindex','target','title','type','value','width','wrap'];
     }
 
     private function cssAutocompleteProperties(): array
@@ -3518,7 +3824,12 @@ final class Az
 
     private function cssAutocompleteValues(): array
     {
-        return ['absolute','auto','baseline','block','bold','border-box','both','center','column','contents','cover','fixed','flex','grid','hidden','inherit','initial','inline','inline-block','inline-flex','inline-grid','italic','left','none','normal','nowrap','pointer','relative','repeat','right','row','scroll','solid','space-around','space-between','space-evenly','sticky','transparent','underline','unset','visible','wrap'];
+        return ['absolute','auto','baseline','block','bold','border-box','both','center','column','contents','cover','fixed','flex','grid','hidden','inherit','initial','inline','inline-block','inline-flex','inline-grid','italic','left','none','normal','nowrap','pointer','relative','repeat','right','row','scroll','solid','space-around','space-between','space-evenly','sticky','transparent','underline','unset','visible','wrap','start','end','stretch','min-content','max-content','fit-content','currentColor','var()','calc()','clamp()','min()','max()','linear-gradient()','rgb()','rgba()','hsl()','hsla()'];
+    }
+
+    private function cssAutocompleteFunctions(): array
+    {
+        return ['var()','calc()','clamp()','min()','max()','repeat()','minmax()','fit-content()','url()','linear-gradient()','radial-gradient()','rgb()','rgba()','hsl()','hsla()','translate()','translateX()','translateY()','scale()','rotate()','skew()'];
     }
 
     private function cssAutocompleteAtRules(): array
@@ -3538,7 +3849,17 @@ final class Az
 
     private function phpAutocompleteFunctions(): array
     {
-        return ['array_filter','array_key_exists','array_keys','array_map','array_merge','array_pop','array_push','array_reduce','array_shift','array_slice','array_values','count','date','dirname','empty','explode','file_exists','file_get_contents','file_put_contents','htmlspecialchars','implode','in_array','is_array','is_dir','is_file','is_null','json_decode','json_encode','ltrim','mb_strlen','mb_substr','preg_match','preg_match_all','preg_replace','print_r','rtrim','sprintf','str_contains','str_ends_with','str_replace','str_starts_with','strlen','strpos','strtolower','strtoupper','substr','trim','var_dump'];
+        return ['array_column','array_filter','array_key_exists','array_keys','array_map','array_merge','array_pop','array_push','array_reduce','array_search','array_shift','array_slice','array_unique','array_values','basename','chr','count','date','dirname','empty','explode','file_exists','file_get_contents','file_put_contents','filter_input','filter_var','fopen','fwrite','getenv','html_entity_decode','htmlspecialchars','implode','in_array','is_array','is_bool','is_dir','is_file','is_int','is_null','is_numeric','is_object','is_string','json_decode','json_encode','ltrim','mb_strlen','mb_strtolower','mb_strtoupper','mb_substr','method_exists','number_format','pathinfo','preg_match','preg_match_all','preg_replace','print_r','realpath','round','rtrim','sprintf','str_contains','str_ends_with','str_replace','str_starts_with','strlen','strpos','strtolower','strtoupper','substr','trim','ucfirst','var_dump'];
+    }
+
+    private function phpAutocompleteConstants(): array
+    {
+        return ['true','false','null','PHP_EOL','PHP_VERSION','DIRECTORY_SEPARATOR','PATH_SEPARATOR','STDIN','STDOUT','STDERR','__DIR__','__FILE__','__LINE__','__CLASS__','__METHOD__','__FUNCTION__','__NAMESPACE__'];
+    }
+
+    private function phpAutocompleteMembers(): array
+    {
+        return ['all','append','count','create','delete','find','first','get','has','insert','isEmpty','jsonSerialize','last','map','merge','pluck','push','save','set','toArray','toJson','update','where'];
     }
 
     private function phpAutocompleteVariables(): array
@@ -3576,82 +3897,106 @@ final class Az
     private function phpSegments(string $line): array
     {
         $segments = [];
-        // Comments first (highest priority, applied last so they win)
-        $this->addRegexSegments($segments, '/\/\/.*$/u', $line, "\033[90m");
-        $this->addRegexSegments($segments, '/\/\*.*?\*\//u', $line, "\033[90m");
-        $this->addRegexSegments($segments, '/#\[/u', $line, "\033[33m"); // attribute start
-        // Strings (double and single quoted, with escape handling)
-        $this->addRegexSegments($segments, '/("(?:[^"\\\\]|\\\\.)*"|\'(?:[^\'\\\\]|\\\\.)*\')/u', $line, "\033[32m");
-        // PHP open/close tags
-        $this->addRegexSegments($segments, '/<\?php\b|<\?=|\?>/u', $line, "\033[33m");
-        // Keywords
         $kw = 'abstract|array|as|break|callable|case|catch|class|clone|const|continue|'
             . 'declare|default|do|echo|else|elseif|empty|enum|extends|final|finally|fn|for|'
             . 'foreach|function|global|goto|if|implements|include|include_once|instanceof|'
             . 'interface|isset|list|match|namespace|new|null|print|private|protected|public|'
             . 'readonly|require|require_once|return|static|switch|throw|trait|try|unset|use|'
             . 'while|yield|true|false|void|self|parent|int|string|float|bool|mixed|never|object';
-        $this->addRegexSegments($segments, '/\\b(' . $kw . ')\\b/u', $line, "\033[35m");
-        // Class names (PascalCase)
-        $this->addRegexSegments($segments, '/\\b[A-Z][A-Za-z0-9_]*/u', $line, "\033[36m");
-        // Variables
-        $this->addRegexSegments($segments, '/\\$[a-zA-Z_][a-zA-Z0-9_]*/u', $line, "\033[33m");
-        // Numbers
-        $this->addRegexSegments($segments, '/\\b\\d+(?:\\.\\d+)?(?:e[+-]?\\d+)?\\b/u', $line, "\033[35m");
-        // Function calls
-        $this->addRegexSegments($segments, '/\\b([a-z_][a-zA-Z0-9_]*)(?=\\s*\\()/u', $line, "\033[34m");
+
+        $this->addRegexSegments($segments, '/("(?:[^"\\\\]|\\\\.)*"|\'(?:[^\'\\\\]|\\\\.)*\')/u', $line, $this->syntaxColor('string'));
+        $this->addRegexSegments($segments, '/<\?php\b|<\?=|\?>/u', $line, $this->syntaxColor('tag'));
+        $this->addRegexSegments($segments, '/#\[[^\]]*\]/u', $line, $this->syntaxColor('attribute'));
+        $this->addRegexSegments($segments, '/\b(' . $kw . ')\b/u', $line, $this->syntaxColor('keyword'));
+        $this->addRegexSegments($segments, '/\b[A-Z][A-Za-z0-9_]*/u', $line, $this->syntaxColor('type'));
+        $this->addRegexSegments($segments, '/\$[a-zA-Z_][a-zA-Z0-9_]*/u', $line, $this->syntaxColor('variable'));
+        $this->addRegexSegments($segments, '/\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b/u', $line, $this->syntaxColor('number'));
+        $this->addRegexSegments($segments, '/\b([a-zA-Z_][a-zA-Z0-9_]*)(?=\s*\()/u', $line, $this->syntaxColor('function'));
+        $this->addRegexGroupSegments($segments, '/(?:->|::)([a-zA-Z_][a-zA-Z0-9_]*)/u', $line, 1, $this->syntaxColor('method'));
+        $this->addRegexSegments($segments, '/\/\/.*$/u', $line, $this->syntaxColor('comment'));
+        $this->addRegexSegments($segments, '/\/\*.*?\*\//u', $line, $this->syntaxColor('comment'));
         return $segments;
     }
 
     private function bladeSegments(string $line): array
     {
-        $segments = $this->phpSegments($line);
-        // Blade directives: @if, @foreach, @yield, @section etc.
-        $this->addRegexSegments($segments, '/@[a-zA-Z][a-zA-Z0-9]*/u', $line, "\033[35m");
-        // Blade echo: {{ ... }} and {!! ... !!}
-        $this->addRegexSegments($segments, '/\{\{--.*?--\}\}/u', $line, "\033[90m");
-        $this->addRegexSegments($segments, '/\{!!.*?!!\}/u', $line, "\033[33m");
-        $this->addRegexSegments($segments, '/\{\{.*?\}\}/u', $line, "\033[33m");
+        $segments = $this->htmlSegments($line);
+        $this->addRegexSegments($segments, '/\{\{--.*?--\}\}/u', $line, $this->syntaxColor('comment'));
+        $this->addRegexSegments($segments, '/@[a-zA-Z][a-zA-Z0-9]*/u', $line, $this->syntaxColor('keyword'));
+        $this->addRegexSegments($segments, '/\{!!.*?!!\}/u', $line, $this->syntaxColor('variable'));
+        $this->addRegexSegments($segments, '/\{\{.*?\}\}/u', $line, $this->syntaxColor('variable'));
+        $this->addRegexSegments($segments, '/\$[a-zA-Z_][a-zA-Z0-9_]*/u', $line, $this->syntaxColor('variable'));
         return $segments;
     }
 
     private function htmlSegments(string $line): array
     {
         $segments = [];
-        $this->addRegexSegments($segments, '/<!--.*?-->/u', $line, "\033[90m");
-        $this->addRegexSegments($segments, '/<\/?[A-Za-z][^>]*>/u', $line, "\033[36m");
-        $this->addRegexSegments($segments, '/("[^"]*"|\'[^\']*\')/u', $line, "\033[32m");
-        $this->addRegexSegments($segments, '/&[A-Za-z0-9#]+;/u', $line, "\033[35m");
+        $this->addRegexSegments($segments, '/<!--.*?-->/u', $line, $this->syntaxColor('comment'));
+        $this->addRegexSegments($segments, '/<\/?!?[A-Za-z][A-Za-z0-9:-]*/u', $line, $this->syntaxColor('tag'));
+        $this->addRegexGroupSegments($segments, '/\s([A-Za-z_:][A-Za-z0-9_:\.-]*)(?=\s*(?:=|\/?>|\s))/u', $line, 1, $this->syntaxColor('attribute'));
+        $this->addRegexSegments($segments, '/("[^"\\\\]*(?:\\\\.[^"\\\\]*)*"|\'[^\'\\\\]*(?:\\\\.[^\'\\\\]*)*\')/u', $line, $this->syntaxColor('string'));
+        $this->addRegexSegments($segments, '/&[A-Za-z0-9#]+;/u', $line, $this->syntaxColor('constant'));
         return $segments;
     }
 
     private function cssSegments(string $line): array
     {
         $segments = [];
-        $this->addRegexSegments($segments, '/\/\*.*?\*\//u', $line, "\033[90m");
-        $this->addRegexSegments($segments, '/("[^"]*"|\'[^\']*\')/u', $line, "\033[32m");
-        $this->addRegexSegments($segments, '/@[A-Za-z_-]+/u', $line, "\033[35m");
-        $this->addRegexSegments($segments, '/[A-Za-z_-][A-Za-z0-9_-]*(?=\s*:)/u', $line, "\033[33m");
-        $this->addRegexSegments($segments, '/#[A-Fa-f0-9]{3,8}\b/u', $line, "\033[35m");
-        $this->addRegexSegments($segments, '/\b\d+(?:\.\d+)?(?:px|em|rem|vh|vw|%|s|ms)?\b/u', $line, "\033[35m");
+        $this->addRegexSegments($segments, '/\/\*.*?\*\//u', $line, $this->syntaxColor('comment'));
+        $this->addRegexSegments($segments, '/("[^"\\\\]*(?:\\\\.[^"\\\\]*)*"|\'[^\'\\\\]*(?:\\\\.[^\'\\\\]*)*\')/u', $line, $this->syntaxColor('string'));
+        $this->addRegexSegments($segments, '/@[A-Za-z_-]+/u', $line, $this->syntaxColor('keyword'));
+        $this->addRegexSegments($segments, '/[A-Za-z_-][A-Za-z0-9_-]*(?=\s*:)/u', $line, $this->syntaxColor('property'));
+        $this->addRegexSegments($segments, '/#[A-Fa-f0-9]{3,8}\b/u', $line, $this->syntaxColor('constant'));
+        $this->addRegexSegments($segments, '/\b\d+(?:\.\d+)?(?:px|em|rem|vh|vw|vmin|vmax|%|s|ms|deg|fr)?\b/u', $line, $this->syntaxColor('number'));
+        $this->addRegexSegments($segments, '/\b(?:var|calc|clamp|min|max|url|rgb|rgba|hsl|hsla|linear-gradient|radial-gradient)(?=\()/u', $line, $this->syntaxColor('function'));
+        $this->addRegexSegments($segments, '/!important\b/u', $line, $this->syntaxColor('important'));
         if (strpos($line, '{') !== false) {
             $pos = strpos($line, '{');
             if ($pos !== false && $pos > 0) {
-                $segments[] = [0, $pos, "\033[36m"];
+                $segments[] = [0, $pos, $this->syntaxColor('selector')];
             }
         }
         return $segments;
     }
 
-    private function addRegexSegments(array &$segments, string $regex, string $line, string $color): void
+    private function addRegexGroupSegments(array &$segments, string $regex, string $line, int $group, string $color): void
     {
-        if (preg_match_all($regex, $line, $matches, PREG_OFFSET_CAPTURE)) {
-            foreach ($matches[0] as $match) {
-                $text = $match[0];
-                $start = $match[1];
+        $matches = [];
+        if (!$this->safePregMatchAll($regex, $line, $matches)) {
+            return;
+        }
+
+        foreach ($matches[$group] ?? [] as $match) {
+            $text = $match[0] ?? '';
+            $start = $match[1] ?? -1;
+            if ($text !== '' && $start >= 0) {
                 $segments[] = [$start, $start + strlen($text), $color];
             }
         }
+    }
+
+    private function addRegexSegments(array &$segments, string $regex, string $line, string $color): void
+    {
+        $matches = [];
+        if (!$this->safePregMatchAll($regex, $line, $matches)) {
+            return;
+        }
+
+        foreach ($matches[0] ?? [] as $match) {
+            $text = $match[0] ?? '';
+            $start = $match[1] ?? -1;
+            if ($text !== '' && $start >= 0) {
+                $segments[] = [$start, $start + strlen($text), $color];
+            }
+        }
+    }
+
+    private function safePregMatchAll(string $regex, string $line, array &$matches): bool
+    {
+        $matches = [];
+        $ok = @preg_match_all($regex, $line, $matches, PREG_OFFSET_CAPTURE);
+        return $ok !== false && $ok > 0;
     }
 
     private function colorAt(array $segments, int $pos): string
@@ -3663,6 +4008,55 @@ final class Az
             }
         }
         return $color;
+    }
+
+    private function currentSyntax(): string
+    {
+        $mode = $this->tab()->syntaxMode;
+        if ($mode !== null && in_array($mode, $this->supportedSyntaxModes(), true)) {
+            return $mode;
+        }
+        return $this->syntaxForPath($this->tab()->path);
+    }
+
+    /** @return string[] */
+    private function supportedSyntaxModes(): array
+    {
+        return ['php', 'blade', 'html', 'css', 'plain'];
+    }
+
+    private function setCurrentSyntax(?string $syntax): void
+    {
+        $tab = $this->tab();
+        if ($syntax === null) {
+            $tab->syntaxMode = null;
+            $this->closeAutocomplete();
+            $this->message = 'Syntax set to auto';
+            return;
+        }
+        if (!in_array($syntax, $this->supportedSyntaxModes(), true)) {
+            $this->message = 'Unknown syntax mode';
+            return;
+        }
+        $tab->syntaxMode = $syntax;
+        $this->closeAutocomplete();
+        $this->message = 'Syntax set to ' . strtoupper($syntax);
+    }
+
+    private function syntaxColor(string $role): string
+    {
+        return match ($role) {
+            'comment' => $this->ansiFg(self::TN_COMMENT),
+            'string' => $this->ansiFg(self::TN_GREEN),
+            'keyword' => $this->ansiFg(self::TN_MAGENTA),
+            'function', 'method' => $this->ansiFg(self::TN_BLUE),
+            'variable' => $this->ansiFg(self::TN_ORANGE),
+            'number', 'constant' => $this->ansiFg(self::TN_YELLOW),
+            'type', 'tag', 'selector' => $this->ansiFg(self::TN_CYAN),
+            'attribute', 'property' => $this->ansiFg(self::TN_GREEN2),
+            'important' => $this->ansiFg(self::TN_RED),
+            default => $this->ansiFg(self::TN_FG),
+        };
     }
 
     private function syntaxForPath(?string $path): string
@@ -3688,6 +4082,50 @@ final class Az
         return 'plain';
     }
 
+    private function ansiFg(string $hex): string
+    {
+        [$r, $g, $b] = $this->rgbFromHex($hex);
+        return "\033[38;2;{$r};{$g};{$b}m";
+    }
+
+    private function ansiBg(string $hex): string
+    {
+        [$r, $g, $b] = $this->rgbFromHex($hex);
+        return "\033[48;2;{$r};{$g};{$b}m";
+    }
+
+    private function ansiStyle(?string $fg = null, ?string $bg = null, bool $bold = false, bool $dim = false, bool $underline = false): string
+    {
+        $parts = [];
+        if ($bold) {
+            $parts[] = '1';
+        }
+        if ($dim) {
+            $parts[] = '2';
+        }
+        if ($underline) {
+            $parts[] = '4';
+        }
+        if ($fg !== null) {
+            [$r, $g, $b] = $this->rgbFromHex($fg);
+            $parts[] = "38;2;{$r};{$g};{$b}";
+        }
+        if ($bg !== null) {
+            [$r, $g, $b] = $this->rgbFromHex($bg);
+            $parts[] = "48;2;{$r};{$g};{$b}";
+        }
+        return $parts ? "\033[" . implode(';', $parts) . 'm' : '';
+    }
+
+    private function rgbFromHex(string $hex): array
+    {
+        $hex = ltrim($hex, '#');
+        if (strlen($hex) === 3) {
+            $hex = $hex[0] . $hex[0] . $hex[1] . $hex[1] . $hex[2] . $hex[2];
+        }
+        return [hexdec(substr($hex, 0, 2)), hexdec(substr($hex, 2, 2)), hexdec(substr($hex, 4, 2))];
+    }
+
     private function wordCount(array $lines): int
     {
         $text = implode("\n", $lines);
@@ -3710,7 +4148,7 @@ final class Az
         if ($path === '') {
             return $base ?? getcwd();
         }
-        if ($path[0] !== DIRECTORY_SEPARATOR && !preg_match('/^[A-Za-z]:[\\\/]/', $path)) {
+        if ($path[0] !== DIRECTORY_SEPARATOR && !preg_match('/^[A-Za-z]:[\\/]/', $path)) {
             $path = ($base ?? getcwd()) . DIRECTORY_SEPARATOR . $path;
         }
         $real = realpath($path);
