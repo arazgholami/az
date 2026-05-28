@@ -1,4 +1,4 @@
-# az
+# az text editor
 
 `az` is a small, sane terminal text editor written in PHP.
 
