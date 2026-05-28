@@ -1,0 +1,2922 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/*
+ * az, a sane & powerful cli text editor
+ * Run: chmod +x az && az [file-or-folder]
+ */
+
+final class AzTab
+{
+    public ?string $path;
+    /** @var string[] */
+    public array $lines;
+    public int $cursorLine = 0;
+    public int $cursorCol = 0;
+    public int $rowOffset = 0;
+    public int $colOffset = 0;
+    public bool $modified = false;
+    public int $revision = 0;
+    public int $savedRevision = 0;
+    /** @var array<int,array{lines:array<int,string>,cursorLine:int,cursorCol:int,rowOffset:int,colOffset:int,revision:int}> */
+    public array $undoStack = [];
+    public string $name;
+
+    public function __construct(?string $path = null, array $lines = [''])
+    {
+        $this->path = $path;
+        $this->lines = count($lines) ? $lines : [''];
+        $this->name = $path ? basename($path) : 'Untitled';
+    }
+}
+
+final class Az
+{
+    private string $root;
+    /** @var AzTab[] */
+    private array $tabs = [];
+    private int $tabIndex = 0;
+    private bool $running = true;
+    private string $originalStty = '';
+    private string $message = 'Welcome to Az';
+    private string $clipboard = '';
+    private string $lastFind = '';
+    private ?string $promptLabel = null;
+    private ?string $promptValue = null;
+    private bool $promptCancelled = false;
+    private ?string $statusFlash = null;
+    private string $focus = 'editor';
+    /** @var array<string,bool> */
+    private array $expanded = [];
+    /** @var array<int,array{path:string,type:string,depth:int,name:string}> */
+    private array $treeRows = [];
+    private int $treeIndex = 0;
+    private int $treeScroll = 0;
+    private ?array $selectionAnchor = null;
+    private bool $needsTreeRefresh = true;
+    private int $rows = 24;
+    private int $cols = 80;
+    private int $treeWidth = 28;
+    private int $baseTreeWidth = 28;
+    private bool $sidebarHidden = false;
+    private int $editorWidth = 50;
+    private int $contentHeight = 20;
+    private int $statusLine = 23;
+    private int $shortcutsLine = 24;
+
+    private bool $showWelcome = false;
+    private bool $hideInitialUntitled = false;
+    private bool $undoGroupActive = false;
+    private bool $undoGroupCaptured = false;
+    private float $altTabHintsUntil = 0.0;
+    private bool $autocompleteVisible = false;
+    /** @var array<int,array{label:string,insert:string,detail:string,type:string}> */
+    private array $autocompleteSuggestions = [];
+    private int $autocompleteIndex = 0;
+    private int $autocompleteLine = 0;
+    private int $autocompleteStartCol = 0;
+    private string $autocompletePrefix = '';
+
+    public function __construct(array $argv)
+    {
+        setlocale(LC_CTYPE, 'C.UTF-8', 'en_US.UTF-8', '');
+
+        $target = $argv[1] ?? getcwd();
+        $target = $this->absolutePath($target);
+
+        if (is_file($target)) {
+            $this->root = dirname($target);
+            $this->openFile($target, false);
+        } else {
+            $this->root = is_dir($target) ? $target : getcwd();
+            $this->newTab(false);
+            $this->focus = 'tree';
+            $this->showWelcome = true;
+            $this->message = 'Folder opened. Ctrl+O quick open, Ctrl+T switches tree/editor';
+        }
+
+        $this->expanded[$this->root] = true;
+    }
+
+    public function run(): void
+    {
+        $this->enableRawMode();
+        $this->clearScreen();
+
+        if ($this->showWelcome) {
+            $this->render();
+            $this->renderWelcomeScreen();
+            $this->waitForKey();
+            $this->showWelcome = false;
+        }
+
+        try {
+            while ($this->running) {
+                $this->render();
+                $key = $this->readKey();
+                if ($key !== '') {
+                    $this->handleKey($key);
+                }
+            }
+        } finally {
+            $this->cleanup();
+        }
+    }
+
+    private function enableRawMode(): void
+    {
+        $this->originalStty = trim((string) shell_exec('stty -g 2>/dev/null'));
+        shell_exec('stty -echo -icanon -isig ixoff -ixon min 0 time 5 2>/dev/null');
+        fwrite(STDOUT, "\033[?25l");
+    }
+
+    private function cleanup(): void
+    {
+        if ($this->originalStty !== '') {
+            shell_exec('stty ' . escapeshellarg($this->originalStty) . ' 2>/dev/null');
+        }
+        fwrite(STDOUT, "\033[0m\033[?25h\033[2J\033[H");
+    }
+
+    private function clearScreen(): void
+    {
+        fwrite(STDOUT, "\033[2J\033[H");
+    }
+
+    private function renderWelcomeScreen(): void
+    {
+        $lines = array_merge([
+            '   __ _ ____',
+            '  / _` |_  /',
+            ' | (_| |/ / ',
+            '  \__,_/___|',
+            '',
+            '  A sane & powerful cli text editor.',
+            '',
+            '  USAGE  az [file]  |  az [directory]  |  az',
+            '',
+        ], $this->shortcutHelpLines(), [
+            '',
+            '  SYNTAX  PHP  Blade  HTML  CSS',
+            '  Press any key to continue ...',
+        ]);
+
+        $this->renderPopupBox($lines, [0 => true, 1 => true, 2 => true, 3 => true]);
+    }
+
+    /**
+     * @return string[]
+     */
+    private function shortcutHelpLines(): array
+    {
+        return [
+            '  EDITING                         NAVIGATION',
+            '    Ctrl+S  Save                  Ctrl+O  Quick open',
+            '    Ctrl+Z  Undo                  Ctrl+T  Show/focus tree',
+            '    Ctrl+W  Remove line           Ctrl+H  Hide/show tree',
+            '    Ctrl+F  Find                  Alt+1-9 Switch tab',
+            '    Ctrl+R  Replace               Ctrl+D  Close tab',
+            '    Tab     Complete              Enter   Accept completion',
+            '    %term   Find/replace ignoring case',
+            '    Ctrl+C  Copy                  Ctrl+/  Help',
+            '    Ctrl+X  Cut                   Ctrl+Q  Quit',
+            '    Ctrl+V  Paste',
+            '    Ctrl+A  Select all',
+        ];
+    }
+
+    private function showShortcutsHelp(): void
+    {
+        $this->render();
+        $lines = array_merge([
+            '',
+            '  KEYBOARD SHORTCUTS',
+            '',
+        ], $this->shortcutHelpLines(), [
+            '',
+            '  [Enter] Start/Resume Editing',
+        ]);
+
+        $this->renderPopupBox($lines);
+        $this->waitForKey();
+        $this->message = '';
+    }
+
+
+    /**
+     * @param string[] $lines
+     * @param array<int,bool> $logoLineIndexes
+     */
+    private function renderPopupBox(array $lines, array $logoLineIndexes = []): void
+    {
+        $this->readTerminalSize();
+        $boxW = max(56, min(84, $this->cols - 4));
+        $boxW = max(24, $boxW);
+        $boxH = count($lines) + 2;
+        $startRow = max(1, (int) floor(($this->rows - $boxH) / 2));
+        $startCol = max(1, (int) floor(($this->cols - $boxW) / 2));
+        $inner = $boxW - 2;
+
+        $out = "\033[?25l";
+        $out .= "\033[{$startRow};{$startCol}H\033[1;36m╔" . str_repeat('═', $inner) . "╗\033[0m";
+
+        foreach ($lines as $idx => $text) {
+            $r = $startRow + 1 + $idx;
+            if ($r >= $this->rows) {
+                break;
+            }
+            $cell = $this->stylePopupLine($text, isset($logoLineIndexes[$idx]));
+            $cell = $this->fitAnsi(' ' . $cell, $inner);
+            $out .= "\033[{$r};{$startCol}H\033[1;36m║\033[0m" . $cell . "\033[1;36m║\033[0m";
+        }
+
+        $br = min($this->rows, $startRow + 1 + count($lines));
+        $out .= "\033[{$br};{$startCol}H\033[1;36m╚" . str_repeat('═', $inner) . "╝\033[0m";
+        fwrite(STDOUT, $out);
+    }
+
+    private function stylePopupLine(string $text, bool $logo = false): string
+    {
+        if ($logo) {
+            return "\033[38;5;208m\033[1m" . $text . "\033[0m";
+        }
+
+        $trim = trim($text);
+        if ($trim === 'KEYBOARD SHORTCUTS' || $trim === 'EDITING                         NAVIGATION' || str_starts_with($trim, 'USAGE') || str_starts_with($trim, 'SYNTAX')) {
+            return "\033[1;36m" . $this->highlightShortcutTokens($text) . "\033[0m";
+        }
+
+        if (str_contains($text, 'Press any key')) {
+            return "\033[2;37m" . $text . "\033[0m";
+        }
+
+        return $this->highlightShortcutTokens($text);
+    }
+
+    private function highlightShortcutTokens(string $text): string
+    {
+        return preg_replace_callback('/Ctrl\+(?:Left\/Right|[A-Z0-9\/])|Alt\+1(?:\.\.9|-9)/', function (array $m): string {
+            return "\033[47m\033[30m" . $m[0] . "\033[0m";
+        }, $text) ?? $text;
+    }
+
+
+    private function waitForKey(): string
+    {
+        do {
+            $key = $this->readKey();
+        } while ($key === '');
+
+        return $key;
+    }
+
+    private function readKey(): string
+    {
+        $c = fread(STDIN, 1);
+        if ($c === false || $c === '') {
+            return '';
+        }
+
+        if ($c === "\033") {
+            $seq = $c;
+            stream_set_blocking(STDIN, false);
+            $start = microtime(true);
+            while ((microtime(true) - $start) < 0.025) {
+                $chunk = fread(STDIN, 64);
+                if ($chunk !== false && $chunk !== '') {
+                    $seq .= $chunk;
+                    $start = microtime(true);
+                    if (preg_match('/^\033\[[0-9;]*[~A-Za-z]$/', $seq) || preg_match('/^\033O[A-Za-z]$/', $seq) || preg_match('/^\033.$/s', $seq)) {
+                        break;
+                    }
+                } else {
+                    usleep(1000);
+                }
+            }
+            stream_set_blocking(STDIN, true);
+            return $seq;
+        }
+
+        $needed = $this->utf8SequenceLength(ord($c));
+        if ($needed > 1) {
+            $seq = $c;
+            stream_set_blocking(STDIN, false);
+            $start = microtime(true);
+            while (strlen($seq) < $needed && (microtime(true) - $start) < 0.05) {
+                $chunk = fread(STDIN, $needed - strlen($seq));
+                if ($chunk !== false && $chunk !== '') {
+                    $seq .= $chunk;
+                    $start = microtime(true);
+                } else {
+                    usleep(1000);
+                }
+            }
+            stream_set_blocking(STDIN, true);
+            return $this->isValidUtf8($seq) ? $seq : $c;
+        }
+
+        return $c;
+    }
+
+    private function handleKey(string $key): void
+    {
+        if ($this->statusFlash !== null) {
+            $this->statusFlash = null;
+        }
+
+        if ($this->focus === 'editor' && $this->handleAutocompleteKey($key)) {
+            return;
+        }
+
+        if ($this->focus !== 'editor') {
+            $this->closeAutocomplete();
+        }
+
+        if ($this->handleGlobalShortcut($key)) {
+            return;
+        }
+
+        if ($this->focus === 'tree') {
+            $this->handleTreeKey($key);
+            return;
+        }
+
+        $this->handleEditorKey($key);
+    }
+
+    private function handleGlobalShortcut(string $key): bool
+    {
+        if ($key === "\033") {
+            $this->altTabHintsUntil = microtime(true) + 1.2;
+            $this->message = 'Alt+1-9 switches tabs';
+            return true;
+        }
+
+        if ($key === "\x11") { // Ctrl+Q
+            $this->confirmQuit();
+            return true;
+        }
+
+        if ($key === "\x13") { // Ctrl+S
+            $this->saveCurrentTab();
+            return true;
+        }
+
+        if ($this->isCtrlQuestion($key)) { // Ctrl+/ in many terminals
+            $this->showShortcutsHelp();
+            return true;
+        }
+
+        if ($key === "\x1a") { // Ctrl+Z
+            $this->undo();
+            return true;
+        }
+
+        if ($key === "\x0f") { // Ctrl+O
+            $this->quickOpen();
+            return true;
+        }
+
+        if ($key === "\x14") { // Ctrl+T
+            if ($this->sidebarHidden) {
+                $this->sidebarHidden = false;
+                $this->focus = 'tree';
+                $this->message = 'Tree shown and focused';
+            } else {
+                $this->focus = $this->focus === 'tree' ? 'editor' : 'tree';
+                $this->message = $this->focus === 'tree' ? 'Tree focused' : 'Editor focused';
+            }
+            return true;
+        }
+
+        if ($key === "\x08") { // Ctrl+H
+            $this->sidebarHidden = !$this->sidebarHidden;
+            if ($this->sidebarHidden && $this->focus === 'tree') {
+                $this->focus = 'editor';
+            }
+            $this->message = $this->sidebarHidden ? 'Tree hidden' : 'Tree shown';
+            return true;
+        }
+
+        if ($key === "\x06") { // Ctrl+F
+            $this->findPrompt();
+            return true;
+        }
+
+        if ($key === "\x12") { // Ctrl+R
+            $this->replacePrompt();
+            return true;
+        }
+
+        if ($key === "\x0e") { // Ctrl+N - new file
+            $this->newTab();
+            $this->message = 'New file';
+            return true;
+        }
+
+        if ($key === "\x04") { // Ctrl+D
+            $this->closeCurrentTab();
+            return true;
+        }
+
+        if ($key === "\x03" || $this->isCtrlShiftLetter($key, 'c')) { // Ctrl+C or Ctrl+Shift+C where available
+            $this->copySelectionOrLine();
+            return true;
+        }
+
+        if ($key === "\x18") { // Ctrl+X
+            $this->cutSelectionOrLine();
+            return true;
+        }
+
+        if ($key === "\x16" || $this->isCtrlShiftLetter($key, 'v')) { // Ctrl+V or Ctrl+Shift+V where available
+            $this->pasteClipboard();
+            return true;
+        }
+
+        if ($key === "\x01") { // Ctrl+A
+            $this->selectAll();
+            return true;
+        }
+
+        if ($this->isCtrlBackspace($key)) {
+            $this->deleteCurrentLine();
+            return true;
+        }
+
+        $tabNumber = $this->tabShortcutNumber($key);
+        if ($tabNumber !== null) {
+            $this->switchToTabNumber($tabNumber);
+            return true;
+        }
+
+        return false;
+    }
+
+    private function quickOpen(): void
+    {
+        $files = $this->collectQuickOpenFiles($this->root, 1000);
+        if (!$files) {
+            $this->message = 'No files found';
+            return;
+        }
+
+        $query = '';
+        $selected = 0;
+
+        while (true) {
+            $matches = $this->filterQuickOpenFiles($files, $query);
+            if ($selected >= count($matches)) {
+                $selected = max(0, count($matches) - 1);
+            }
+
+            $this->renderQuickOpen($query, $matches, $selected);
+            $key = $this->readKey();
+
+            if ($key === "\r" || $key === "\n") {
+                if (isset($matches[$selected])) {
+                    $this->openFile($matches[$selected]['path']);
+                    $this->revealPathInTree($matches[$selected]['path']);
+                    $this->focus = 'editor';
+                    $this->message = 'Opened ' . $matches[$selected]['label'];
+                } else {
+                    $this->message = 'No match';
+                }
+                return;
+            }
+
+            if ($key === "\033") {
+                $this->message = 'Quick open cancelled';
+                return;
+            }
+
+            if ($key === "\033[A" || $key === "\x10") { // Up or Ctrl+P
+                $selected = max(0, $selected - 1);
+                continue;
+            }
+
+            if ($key === "\033[B" || $key === "\x0e") { // Down or Ctrl+N
+                $selected = min(max(0, count($matches) - 1), $selected + 1);
+                continue;
+            }
+
+            if ($key === "\177" || $key === "\x08") {
+                $query = $this->removeLastUtf8Char($query);
+                $selected = 0;
+                continue;
+            }
+
+            if ($key === "\x15") { // Ctrl+U
+                $query = '';
+                $selected = 0;
+                continue;
+            }
+
+            if ($this->isPrintable($key)) {
+                $query .= $key;
+                $selected = 0;
+            }
+        }
+    }
+
+    /**
+     * @return array<int,array{path:string,label:string}>
+     */
+    private function collectQuickOpenFiles(string $dir, int $limit): array
+    {
+        $files = [];
+        $base = rtrim($dir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+        $skipDirs = ['.git' => true, 'node_modules' => true, 'vendor' => true, '.idea' => true, '.vscode' => true];
+
+        $stack = [$dir];
+        while ($stack && count($files) < $limit) {
+            $current = array_pop($stack);
+            $items = @scandir($current);
+            if ($items === false) {
+                continue;
+            }
+
+            $dirs = [];
+            $plainFiles = [];
+            foreach ($items as $item) {
+                if ($item === '.' || $item === '..') {
+                    continue;
+                }
+                $path = $current . DIRECTORY_SEPARATOR . $item;
+                if (is_dir($path)) {
+                    if (!isset($skipDirs[$item])) {
+                        $dirs[] = $path;
+                    }
+                } elseif (is_file($path)) {
+                    $plainFiles[] = $path;
+                }
+            }
+
+            rsort($dirs, SORT_NATURAL | SORT_FLAG_CASE);
+            foreach ($dirs as $path) {
+                $stack[] = $path;
+            }
+
+            sort($plainFiles, SORT_NATURAL | SORT_FLAG_CASE);
+            foreach ($plainFiles as $path) {
+                $label = strpos($path, $base) === 0 ? substr($path, strlen($base)) : $path;
+                $files[] = ['path' => $path, 'label' => $label];
+                if (count($files) >= $limit) {
+                    break;
+                }
+            }
+        }
+
+        usort($files, fn(array $a, array $b): int => strcasecmp($a['label'], $b['label']));
+        return $files;
+    }
+
+    /**
+     * @param array<int,array{path:string,label:string}> $files
+     * @return array<int,array{path:string,label:string}>
+     */
+    private function filterQuickOpenFiles(array $files, string $query): array
+    {
+        $query = trim($query);
+        if ($query === '') {
+            return array_slice($files, 0, 12);
+        }
+
+        $ranked = [];
+        foreach ($files as $file) {
+            $score = $this->quickOpenScore($file['label'], $query);
+            if ($score !== null) {
+                $ranked[] = ['score' => $score, 'file' => $file];
+            }
+        }
+
+        usort($ranked, fn(array $a, array $b): int => $a['score'] <=> $b['score']);
+        return array_slice(array_map(fn(array $item): array => $item['file'], $ranked), 0, 12);
+    }
+
+    private function quickOpenScore(string $label, string $query): ?int
+    {
+        $haystack = strtolower($label);
+        $needle = strtolower($query);
+
+        $exact = strpos($haystack, $needle);
+        if ($exact !== false) {
+            return $exact;
+        }
+
+        $score = 0;
+        $pos = 0;
+        foreach (str_split($needle) as $char) {
+            $found = strpos($haystack, $char, $pos);
+            if ($found === false) {
+                return null;
+            }
+            $score += ($found - $pos) + 1;
+            $pos = $found + 1;
+        }
+
+        return $score + strlen($label);
+    }
+
+    /**
+     * @param array<int,array{path:string,label:string}> $matches
+     */
+    private function renderQuickOpen(string $query, array $matches, int $selected): void
+    {
+        $oldMessage = $this->message;
+        $this->message = 'Quick open';
+        $this->render();
+        $this->message = $oldMessage;
+
+        $rows = min(12, max(1, $this->rows - 8));
+        $panelWidth = min($this->cols - 6, max(46, (int) floor($this->cols * 0.62)));
+        $panelWidth = max(28, $panelWidth);
+        $panelHeight = $rows + 4;
+        $startCol = max(1, (int) floor(($this->cols - $panelWidth) / 2));
+        $startRow = max(2, (int) floor(($this->rows - $panelHeight) / 2));
+        $inner = $panelWidth - 2;
+
+        $title = ' Quick Open '; 
+        $queryLine = ($query === '' ? 'type to search files' : $query);
+
+        $out = "\033[?25l";
+        $out .= "\033[{$startRow};{$startCol}H\033[1;36m╔" . str_repeat('═', $inner) . "╗\033[0m";
+        $out .= "\033[" . ($startRow + 1) . ";{$startCol}H\033[1;36m║\033[0m\033[48;5;24m\033[37m" . $this->fitPlain($title, $inner) . "\033[0m\033[1;36m║\033[0m";
+        $out .= "\033[" . ($startRow + 2) . ";{$startCol}H\033[1;36m║\033[0m\033[48;5;236m\033[37m" . $this->fitPlain($queryLine, $inner) . "\033[0m\033[1;36m║\033[0m";
+        $out .= "\033[" . ($startRow + 3) . ";{$startCol}H\033[1;36m╠" . str_repeat('═', $inner) . "╣\033[0m";
+
+        for ($i = 0; $i < $rows; $i++) {
+            $row = $startRow + 4 + $i;
+            $match = $matches[$i] ?? null;
+            $prefix = $i === $selected ? ' › ' : '   ';
+            $label = $match ? $prefix . $match['label'] : '';
+            if (!$matches && $i === 0) {
+                $label = '   No matching files';
+            }
+            $line = $this->fitPlain($label, $inner);
+            $style = $i === $selected && $match ? "\033[48;5;220m\033[30m" : "\033[48;5;236m\033[37m";
+            $out .= "\033[{$row};{$startCol}H\033[1;36m║\033[0m{$style}{$line}\033[0m\033[1;36m║\033[0m";
+        }
+
+        $bottom = $startRow + $panelHeight - 1;
+        $out .= "\033[{$bottom};{$startCol}H\033[1;36m╚" . str_repeat('═', $inner) . "╝\033[0m";
+        fwrite(STDOUT, $out);
+    }
+
+    private function revealPathInTree(string $path): void
+    {
+        $path = $this->absolutePath($path);
+        if ($path !== $this->root && strpos($path, $this->root . DIRECTORY_SEPARATOR) !== 0) {
+            return;
+        }
+
+        $dir = is_dir($path) ? $path : dirname($path);
+        $ancestors = [];
+        while ($dir !== '' && $dir !== dirname($dir)) {
+            $ancestors[] = $dir;
+            if ($dir === $this->root) {
+                break;
+            }
+            $dir = dirname($dir);
+        }
+
+        foreach (array_reverse($ancestors) as $ancestor) {
+            if ($ancestor === $this->root || strpos($ancestor, $this->root . DIRECTORY_SEPARATOR) === 0) {
+                $this->expanded[$ancestor] = true;
+            }
+        }
+
+        $this->needsTreeRefresh = true;
+        $this->refreshTree();
+        foreach ($this->treeRows as $i => $row) {
+            if ($row['path'] === $path) {
+                $this->treeIndex = $i;
+                $this->ensureTreeVisible();
+                return;
+            }
+        }
+    }
+
+    private function handleTreeKey(string $key): void
+    {
+        $this->refreshTree();
+
+        if ($key === "\033[A") {
+            $this->treeIndex = max(0, $this->treeIndex - 1);
+            return;
+        }
+        if ($key === "\033[B") {
+            $this->treeIndex = min(max(0, count($this->treeRows) - 1), $this->treeIndex + 1);
+            return;
+        }
+        if ($key === "\033[5~") {
+            $this->treeIndex = max(0, $this->treeIndex - max(1, $this->contentHeight));
+            return;
+        }
+        if ($key === "\033[6~") {
+            $this->treeIndex = min(max(0, count($this->treeRows) - 1), $this->treeIndex + max(1, $this->contentHeight));
+            return;
+        }
+        if ($key === "\n" || $key === "\r") {
+            $row = $this->treeRows[$this->treeIndex] ?? null;
+            if (!$row) {
+                return;
+            }
+            if ($row['type'] === 'dir') {
+                $this->expanded[$row['path']] = !($this->expanded[$row['path']] ?? false);
+                $this->needsTreeRefresh = true;
+            } elseif (is_file($row['path'])) {
+                $this->openFile($row['path']);
+                $this->focus = 'editor';
+            }
+            return;
+        }
+        if ($key === "\033[D") {
+            $row = $this->treeRows[$this->treeIndex] ?? null;
+            if ($row && $row['type'] === 'dir') {
+                $this->expanded[$row['path']] = false;
+                $this->needsTreeRefresh = true;
+            }
+            return;
+        }
+        if ($key === "\033[C") {
+            $row = $this->treeRows[$this->treeIndex] ?? null;
+            if ($row && $row['type'] === 'dir') {
+                $this->expanded[$row['path']] = true;
+                $this->needsTreeRefresh = true;
+            }
+        }
+    }
+
+    private function handleEditorKey(string $key): void
+    {
+        if ($this->isCtrlLeft($key)) { $this->moveWordLeft(false); return; }
+        if ($this->isCtrlRight($key)) { $this->moveWordRight(false); return; }
+        if ($this->isCtrlShiftLeft($key)) { $this->moveWordLeft(true); return; }
+        if ($this->isCtrlShiftRight($key)) { $this->moveWordRight(true); return; }
+
+        if ($key === "\033[A") { $this->closeAutocomplete(); $this->moveCursor(-1, 0, false); return; }
+        if ($key === "\033[B") { $this->closeAutocomplete(); $this->moveCursor(1, 0, false); return; }
+        if ($key === "\033[C") { $this->closeAutocomplete(); $this->moveRight(false); return; }
+        if ($key === "\033[D") { $this->closeAutocomplete(); $this->moveLeft(false); return; }
+
+        if ($key === "\033[1;2A" || $key === "\033[A\033[1;2A") { $this->moveCursor(-1, 0, true); return; }
+        if ($key === "\033[1;2B") { $this->moveCursor(1, 0, true); return; }
+        if ($key === "\033[1;2C") { $this->moveRight(true); return; }
+        if ($key === "\033[1;2D") { $this->moveLeft(true); return; }
+
+        if ($key === "\033[H" || $key === "\033OH" || $key === "\033[1~") { $this->home(false); return; }
+        if ($key === "\033[F" || $key === "\033OF" || $key === "\033[4~") { $this->end(false); return; }
+        if ($key === "\033[1;2H") { $this->home(true); return; }
+        if ($key === "\033[1;2F") { $this->end(true); return; }
+        if ($key === "\033[5~") { $this->page(-1, false); return; }
+        if ($key === "\033[6~") { $this->page(1, false); return; }
+        if ($key === "\033[3~") { $this->deleteForward(); $this->refreshAutocomplete(); return; }
+        if ($key === "\177" || $key === "\x08") { $this->backspace(); $this->refreshAutocomplete(); return; }
+        if ($key === "\n" || $key === "\r") { $this->closeAutocomplete(); $this->insertNewline(); return; }
+        if ($key === "\033") { $this->closeAutocomplete(); $this->clearSelection(); $this->message = 'Selection cleared'; return; }
+
+        if ($this->isPrintable($key)) {
+            $this->insertText($key);
+            if ($key !== "\t") {
+                $this->refreshAutocomplete();
+            }
+        }
+    }
+
+    private function render(): void
+    {
+        $this->readTerminalSize();
+        $this->refreshTree();
+        $this->updateTreeWidth();
+        $this->ensureEditorVisible();
+        $this->ensureTreeVisible();
+
+        $out = "\033[?25l\033[H";
+        $out .= $this->renderTopbar();
+        $out .= $this->renderContent();
+        $out .= $this->renderStatusLine();
+
+        $tab = $this->tab();
+        $wrappedRows = $this->wrappedRows();
+        [$cursorVisualIndex, $cursorVisualCol] = $this->cursorVisualPosition($wrappedRows);
+        $cursorRow = 2 + ($cursorVisualIndex - $tab->rowOffset);
+        $cursorCol = $this->editorStartCol() + $cursorVisualCol;
+        if ($this->focus === 'tree' && !$this->sidebarHidden) {
+            $visibleIndex = $this->treeIndex - $this->treeScroll;
+            $cursorRow = 2 + max(0, min($this->contentHeight - 1, $visibleIndex));
+            $cursorCol = 1;
+        }
+        $cursorRow = max(1, min($this->rows, $cursorRow));
+        $cursorCol = max(1, min($this->cols, $cursorCol));
+        $out .= $this->renderAutocompleteDropdown($cursorRow, $cursorCol);
+        $out .= "\033[{$cursorRow};{$cursorCol}H\033[?25h";
+
+        fwrite(STDOUT, $out);
+    }
+
+    private function renderTopbar(): string
+    {
+        return $this->renderTopbarLine();
+    }
+
+    private function topbarStyle(): string
+    {
+        return "\033[48;5;208m\033[30m\033[1m";
+    }
+
+    private function renderTopbarLine(): string
+    {
+        $style = $this->topbarStyle();
+        $right = ' ' . date('h:i A') . '  ' . date('d/m/Y') . ' ';
+        $title = ' az | sane editor ';
+
+        if ($this->sidebarHidden) {
+            $prefix = $title . ' ';
+        } else {
+            $prefix = $this->fitPlain($title, $this->treeWidth) . ' ';
+        }
+
+        $rightWidth = $this->visualWidth($right);
+        $prefixWidth = $this->visualWidth($prefix);
+        $availableForTabs = max(0, $this->cols - $prefixWidth - $rightWidth);
+        $tabs = $this->fitAnsi($this->renderTabsText($style), $availableForTabs);
+        $left = $this->fitAnsi($prefix . $tabs, max(0, $this->cols - $rightWidth));
+
+        return $style . $left . $style . $right . "\033[0m\r\n";
+    }
+
+    private function renderTabsText(string $baseStyle = ''): string
+    {
+        $parts = [];
+        $visible = $this->visibleTabIndexes();
+        $showAltHints = $this->shouldShowAltTabHints();
+
+        foreach ($visible as $visibleIndex => $tabIndex) {
+            $tab = $this->tabs[$tabIndex];
+            $num = (string) ($visibleIndex + 1);
+            $name = $this->escapeControl($tab->name);
+            $modified = $tab->modified ? '*' : '';
+
+            if ($tabIndex === $this->tabIndex) {
+                $number = $showAltHints ? "\033[4m{$num}\033[24m" : $num;
+                $parts[] = "\033[47m\033[30m {$number}:{$name}{$modified} \033[0m" . $baseStyle;
+            } else {
+                $number = $showAltHints ? "\033[38;5;208m\033[4m{$num}\033[24m\033[30m" : $num;
+                $parts[] = " {$number}:{$name}{$modified} ";
+            }
+        }
+
+        return implode('', $parts);
+    }
+
+    private function shouldShowAltTabHints(): bool
+    {
+        return microtime(true) < $this->altTabHintsUntil;
+    }
+
+    private function visibleTabIndexes(): array
+    {
+        $indexes = [];
+        foreach ($this->tabs as $i => $tab) {
+            if ($this->isHiddenInitialTab($i, $tab)) {
+                continue;
+            }
+            $indexes[] = $i;
+        }
+        return $indexes;
+    }
+
+    private function isHiddenInitialTab(int $index, AzTab $tab): bool
+    {
+        return $this->hideInitialUntitled
+            && $index === 0
+            && $tab->path === null
+            && !$tab->modified
+            && count($tab->lines) === 1
+            && $tab->lines[0] === '';
+    }
+
+    private function renderContent(): string
+    {
+        $out = '';
+        $tab = $this->tab();
+        $syntax = $this->syntaxForPath($tab->path);
+        $wrappedRows = $this->wrappedRows();
+
+        for ($screenLine = 0; $screenLine < $this->contentHeight; $screenLine++) {
+            $visualIndex = $tab->rowOffset + $screenLine;
+            $wrapped = $wrappedRows[$visualIndex] ?? null;
+            $editorText = '';
+            if ($wrapped) {
+                $lineNo = $wrapped['line'];
+                $editorText = $this->renderEditorLine($tab->lines[$lineNo], $lineNo, $syntax, $wrapped['start'], $wrapped['end']);
+            }
+
+            if (!$this->sidebarHidden) {
+                $treeText = $this->renderTreeLine($screenLine);
+                $out .= $this->fitAnsi($treeText, $this->treeWidth);
+                $out .= "\033[2m│\033[0m";
+            }
+
+            $out .= $this->fitAnsi($editorText, $this->editorWidth);
+            $out .= "\r\n";
+        }
+
+        return $out;
+    }
+
+    private function renderTreeLine(int $screenLine): string
+    {
+        $index = $this->treeScroll + $screenLine;
+        $row = $this->treeRows[$index] ?? null;
+        if (!$row) {
+            return str_repeat(' ', $this->treeWidth);
+        }
+
+        $text = $this->treePlainText($row);
+        $active = $index === $this->treeIndex;
+        $isOpen = false;
+        foreach ($this->tabs as $tab) {
+            if ($tab->path === $row['path']) {
+                $isOpen = true;
+                break;
+            }
+        }
+        $style = '';
+        if ($active && $this->focus === 'tree') {
+            $style = "\033[7m";
+        } elseif ($row['type'] === 'dir') {
+            $style = "\033[36m";
+        } elseif ($isOpen) {
+            $style = "\033[32m";
+        }
+        return $style . $this->escapeControl($text) . "\033[0m";
+    }
+
+    private function renderEditorLine(string $line, int $lineNo, string $syntax, int $startCol = 0, ?int $endCol = null): string
+    {
+        $segments = $this->highlightSegments($line, $syntax);
+        $selection = $this->selectionRange();
+        $out = '';
+
+        $tabSize = 4;
+        $lineLen = strlen($line);
+        $startCol = $this->clampByteCol($line, $startCol);
+        $endCol = $endCol === null ? $lineLen : $this->clampByteCol($line, min($endCol, $lineLen));
+        $visualCol = 0;
+        $emitted = 0;
+
+        for ($i = $startCol; $i < $endCol && $emitted < $this->editorWidth;) {
+            $char = $this->utf8CharAt($line, $i);
+            $byteLen = max(1, strlen($char));
+            $charWidth = ($char === "\t") ? ($tabSize - ($visualCol % $tabSize)) : $this->charDisplayWidth($char);
+
+            if ($charWidth > 0 && $emitted + $charWidth > $this->editorWidth) {
+                break;
+            }
+
+            $color = $this->colorAt($segments, $i);
+            $selected = $selection && $this->positionInRange($lineNo, $i, $selection);
+
+            if ($char === "\t") {
+                $pad = str_repeat(' ', max(1, min($charWidth, $this->editorWidth - $emitted)));
+                $out .= $selected ? "\033[7m{$pad}\033[0m" : $pad;
+            } else {
+                $safeChar = $this->escapeControl($char);
+                $out .= $selected
+                    ? "\033[7m" . $color . $safeChar . "\033[0m"
+                    : $color . $safeChar . "\033[0m";
+            }
+
+            $emitted += $charWidth;
+            $visualCol += $charWidth;
+            $i += $byteLen;
+        }
+
+        return $out;
+    }
+
+    /**
+     * @return array<int,array{line:int,start:int,end:int}>
+     */
+    private function wrappedRows(): array
+    {
+        $tab = $this->tab();
+        $width = max(1, $this->editorWidth);
+        $rows = [];
+
+        foreach ($tab->lines as $lineNo => $line) {
+            $len = strlen($line);
+            if ($len === 0) {
+                $rows[] = ['line' => $lineNo, 'start' => 0, 'end' => 0];
+                continue;
+            }
+
+            $start = 0;
+            while ($start < $len) {
+                $end = $this->wrapEndForLine($line, $start, $width);
+                if ($end <= $start) {
+                    $end = min($len, $start + 1);
+                }
+                $rows[] = ['line' => $lineNo, 'start' => $start, 'end' => $end];
+                $start = $end;
+            }
+        }
+
+        return $rows ?: [['line' => 0, 'start' => 0, 'end' => 0]];
+    }
+
+    private function wrapEndForLine(string $line, int $start, int $width): int
+    {
+        $len = strlen($line);
+        $start = $this->clampByteCol($line, $start);
+        $visual = 0;
+        $lastBreak = null;
+        $i = $start;
+
+        while ($i < $len) {
+            $char = $this->utf8CharAt($line, $i);
+            $byteLen = max(1, strlen($char));
+            $charWidth = ($char === "\t") ? (4 - ($visual % 4)) : $this->charDisplayWidth($char);
+            if ($charWidth > 0 && $visual + $charWidth > $width) {
+                break;
+            }
+            $visual += $charWidth;
+            $next = min($len, $i + $byteLen);
+            if ($char === ' ' || $char === "\t" || $char === '-' || $char === '/' || $char === '_') {
+                $lastBreak = $next;
+            }
+            $i = $next;
+        }
+
+        if ($i >= $len) {
+            return $len;
+        }
+
+        if ($lastBreak !== null && $lastBreak > $start) {
+            return $lastBreak;
+        }
+
+        return max($this->nextCharOffset($line, $start), $i);
+    }
+
+    /**
+     * @param array<int,array{line:int,start:int,end:int}> $wrappedRows
+     * @return array{0:int,1:int}
+     */
+    private function cursorVisualPosition(array $wrappedRows): array
+    {
+        $tab = $this->tab();
+        foreach ($wrappedRows as $idx => $row) {
+            if ($row['line'] !== $tab->cursorLine) {
+                continue;
+            }
+            $next = $wrappedRows[$idx + 1] ?? null;
+            $isLastSegmentForLine = !$next || $next['line'] !== $row['line'];
+            if ($tab->cursorCol >= $row['start'] && ($tab->cursorCol < $row['end'] || $isLastSegmentForLine)) {
+                $sliceLen = max(0, $tab->cursorCol - $row['start']);
+                $visualCol = $this->visualWidth(substr($tab->lines[$tab->cursorLine], $row['start'], $sliceLen));
+                return [$idx, min($visualCol, max(0, $this->editorWidth - 1))];
+            }
+        }
+
+        return [0, 0];
+    }
+
+    private function editorStartCol(): int
+    {
+        return $this->sidebarHidden ? 1 : $this->treeWidth + 2;
+    }
+
+    private function updateTreeWidth(): void
+    {
+        if ($this->sidebarHidden) {
+            $this->treeWidth = 0;
+            $this->editorWidth = max(10, $this->cols);
+            return;
+        }
+
+        $wanted = $this->baseTreeWidth;
+        foreach ($this->treeRows as $row) {
+            $wanted = max($wanted, strlen($this->treePlainText($row)) + 1);
+        }
+
+        $cap = max($this->baseTreeWidth, min((int) floor($this->cols * 0.45), $this->cols - 16));
+        $this->treeWidth = max(12, min($wanted, $cap));
+        $this->editorWidth = max(10, $this->cols - $this->treeWidth - 1);
+    }
+
+    /**
+     * @param array{path:string,type:string,depth:int,name:string} $row
+     */
+    private function treePlainText(array $row): string
+    {
+        $indent = str_repeat('  ', max(0, $row['depth']));
+        $marker = $row['type'] === 'dir' ? (($this->expanded[$row['path']] ?? false) ? '- ' : '+ ') : '  ';
+        return $indent . $marker . $row['name'];
+    }
+
+
+    private function renderStatusLine(): string
+    {
+        // Prompt mode: render an orange input bar
+        if ($this->message === '__PROMPT__' && $this->promptLabel !== null) {
+            $label = $this->promptLabel;
+            $value = $this->promptValue ?? '';
+            // " az> " prefix (5 chars) + label (bold) + value (normal) + cursor hint
+            $prefix = ' az> ';
+            $hint = '  (Enter confirm, Esc cancel, Ctrl+U clear)';
+            $left = $prefix . $label . $value;
+            $right = $hint;
+            $pad = max(0, $this->cols - strlen($left) - strlen($right));
+            $text = $this->fitPlain($left . str_repeat(' ', $pad) . $right, $this->cols);
+            // Orange background (color 208 on 256-color, fallback to bold yellow inverse)
+            return "\033[0m\033[48;5;208m\033[30m\033[1m" . substr($text, 0, 5)
+                . "\033[22m\033[1m" . $label . "\033[0m\033[48;5;208m\033[30m" . $value
+                . str_repeat(' ', max(0, $this->cols - strlen($left)))
+                . "\033[0m";
+        }
+
+        $tab = $this->tab();
+        $path = $tab->path ? $this->relativePath($tab->path) : ($this->hideInitialUntitled ? '[no file]' : '[new file]');
+        $state = $this->statusFlash ?? ($tab->modified ? 'modified' : 'saved');
+        $focus = $this->focus === 'tree' ? 'TREE' : 'EDIT';
+        $msg = trim($this->message);
+        $help = 'Ctrl+/ Help';
+        $tree = $this->sidebarHidden ? 'Tree hidden' : 'Tree shown';
+        $text = " {$focus}  {$path}  {$state}  {$tree}";
+        if ($msg !== '') {
+            $text .= "  {$msg}";
+        }
+        if ($this->autocompleteVisible) {
+            $text .= '  Autocomplete: ↑/↓ choose, Tab/Enter accept, Esc close';
+        }
+        $text .= "  {$help}";
+
+        if ($this->statusFlash !== null) {
+            return "\033[48;5;208m\033[30m" . $this->fitPlain($text, $this->cols) . "\033[0m";
+        }
+
+        return "\033[7m" . $this->fitPlain($text, $this->cols) . "\033[0m";
+    }
+
+    private function refreshTree(): void
+    {
+        if (!$this->needsTreeRefresh && $this->treeRows) {
+            return;
+        }
+
+        $this->treeRows = [];
+        $this->addTreeRows($this->root, 0);
+        if (!$this->treeRows) {
+            $this->treeRows[] = ['path' => $this->root, 'type' => 'dir', 'depth' => 0, 'name' => basename($this->root) ?: $this->root];
+        }
+        $this->treeIndex = max(0, min($this->treeIndex, count($this->treeRows) - 1));
+        $this->needsTreeRefresh = false;
+    }
+
+    private function addTreeRows(string $dir, int $depth): void
+    {
+        $name = $depth === 0 ? (basename($this->root) ?: $this->root) : basename($dir);
+        $this->treeRows[] = ['path' => $dir, 'type' => 'dir', 'depth' => $depth, 'name' => $name];
+        if (!($this->expanded[$dir] ?? false)) {
+            return;
+        }
+
+        $items = @scandir($dir);
+        if ($items === false) {
+            return;
+        }
+
+        $dirs = [];
+        $files = [];
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            if (in_array($item, ['.git', 'node_modules', 'vendor', '.idea', '.vscode'], true)) {
+                continue;
+            }
+            $path = $dir . DIRECTORY_SEPARATOR . $item;
+            if (is_dir($path)) {
+                $dirs[] = $path;
+            } elseif (is_file($path)) {
+                $files[] = $path;
+            }
+        }
+        sort($dirs, SORT_NATURAL | SORT_FLAG_CASE);
+        sort($files, SORT_NATURAL | SORT_FLAG_CASE);
+
+        foreach ($dirs as $path) {
+            $this->addTreeRows($path, $depth + 1);
+        }
+        foreach ($files as $path) {
+            $this->treeRows[] = ['path' => $path, 'type' => 'file', 'depth' => $depth + 1, 'name' => basename($path)];
+        }
+    }
+
+    private function ensureEditorVisible(): void
+    {
+        $tab = $this->tab();
+        $this->contentHeight = max(1, $this->rows - 2);
+        $this->editorWidth = max(10, $this->cols - ($this->sidebarHidden ? 0 : $this->treeWidth + 1));
+        $tab->colOffset = 0;
+
+        $wrappedRows = $this->wrappedRows();
+        [$cursorVisualIndex] = $this->cursorVisualPosition($wrappedRows);
+
+        if ($cursorVisualIndex < $tab->rowOffset) {
+            $tab->rowOffset = $cursorVisualIndex;
+        } elseif ($cursorVisualIndex >= $tab->rowOffset + $this->contentHeight) {
+            $tab->rowOffset = $cursorVisualIndex - $this->contentHeight + 1;
+        }
+
+        $tab->rowOffset = max(0, min($tab->rowOffset, max(0, count($wrappedRows) - 1)));
+    }
+
+    private function ensureTreeVisible(): void
+    {
+        if ($this->sidebarHidden) {
+            return;
+        }
+        if ($this->treeIndex < $this->treeScroll) {
+            $this->treeScroll = $this->treeIndex;
+        } elseif ($this->treeIndex >= $this->treeScroll + $this->contentHeight) {
+            $this->treeScroll = $this->treeIndex - $this->contentHeight + 1;
+        }
+        $this->treeScroll = max(0, $this->treeScroll);
+    }
+
+    private function readTerminalSize(): void
+    {
+        $size = trim((string) shell_exec('stty size 2>/dev/null'));
+        if (preg_match('/^(\d+)\s+(\d+)$/', $size, $m)) {
+            $this->rows = max(8, (int) $m[1]);
+            $this->cols = max(40, (int) $m[2]);
+        }
+        $this->baseTreeWidth = min(36, max(20, (int) floor($this->cols * 0.28)));
+        if ($this->cols < 70) {
+            $this->baseTreeWidth = min(24, max(16, (int) floor($this->cols * 0.30)));
+        }
+        $this->treeWidth = $this->sidebarHidden ? 0 : $this->baseTreeWidth;
+        $this->editorWidth = max(10, $this->cols - ($this->sidebarHidden ? 0 : $this->treeWidth + 1));
+        $this->contentHeight = max(1, $this->rows - 2);
+        $this->statusLine = $this->rows;
+        $this->shortcutsLine = $this->rows;
+    }
+
+    private function openFile(string $path, bool $announce = true): void
+    {
+        $path = $this->absolutePath($path);
+        foreach ($this->tabs as $i => $tab) {
+            if ($tab->path === $path) {
+                $this->tabIndex = $i;
+                $this->hideInitialUntitled = false;
+                $this->message = 'Already open: ' . basename($path);
+                return;
+            }
+        }
+
+        $contents = @file_get_contents($path);
+        if ($contents === false) {
+            $this->message = 'Could not open: ' . $path;
+            return;
+        }
+        if (str_starts_with($contents, "\xEF\xBB\xBF")) {
+            $contents = substr($contents, 3);
+        }
+        $contents = str_replace(["\r\n", "\r"], "\n", $contents);
+        $lines = explode("\n", $contents);
+        if ($lines === []) {
+            $lines = [''];
+        }
+
+        if (isset($this->tabs[0]) && $this->isHiddenInitialTab(0, $this->tabs[0])) {
+            $this->tabs[0] = new AzTab($path, $lines);
+            $this->tabIndex = 0;
+            $this->hideInitialUntitled = false;
+        } else {
+            $this->tabs[] = new AzTab($path, $lines);
+            $this->tabIndex = count($this->tabs) - 1;
+        }
+
+        if ($announce) {
+            $this->message = 'Opened ' . $this->relativePath($path);
+        }
+    }
+
+    private function newTab(bool $visible = true): void
+    {
+        if ($visible && isset($this->tabs[0]) && $this->isHiddenInitialTab(0, $this->tabs[0])) {
+            $this->tabs[0] = new AzTab(null, ['']);
+            $this->tabIndex = 0;
+            $this->hideInitialUntitled = false;
+            return;
+        }
+
+        $this->tabs[] = new AzTab(null, ['']);
+        $this->tabIndex = count($this->tabs) - 1;
+        $this->hideInitialUntitled = !$visible && count($this->tabs) === 1;
+    }
+
+    private function closeCurrentTab(): void
+    {
+        $tab = $this->tab();
+        if ($tab->modified) {
+            $answer = strtolower($this->prompt('Unsaved changes. Close without saving? y/N: '));
+            if ($answer !== 'y') {
+                $this->message = 'Close cancelled';
+                return;
+            }
+        }
+        array_splice($this->tabs, $this->tabIndex, 1);
+        if (!$this->tabs) {
+            $this->newTab(false);
+            $this->focus = 'tree';
+        }
+        $this->tabIndex = max(0, min($this->tabIndex, count($this->tabs) - 1));
+        $this->clearSelection();
+        $this->message = 'Tab closed';
+    }
+
+    private function saveCurrentTab(): void
+    {
+        $tab = $this->tab();
+        if ($tab->path === null) {
+            $name = $this->prompt('Save as: ');
+            if ($name === '') {
+                $this->message = 'Save cancelled';
+                return;
+            }
+            $path = $this->absolutePath($name, $this->root);
+            $tab->path = $path;
+            $tab->name = basename($path);
+        }
+        $ok = @file_put_contents($tab->path, implode("\n", $tab->lines));
+        if ($ok === false) {
+            $this->message = 'Save failed: ' . $tab->path;
+            return;
+        }
+        $tab->savedRevision = $tab->revision;
+        $tab->modified = false;
+        $this->needsTreeRefresh = true;
+        $this->message = '';
+        $this->statusFlash = 'Saved';
+    }
+
+    private function confirmQuit(): void
+    {
+        foreach ($this->tabs as $tab) {
+            if ($tab->modified) {
+                $answer = strtolower($this->prompt('Unsaved changes. Quit without saving? y/N: '));
+                if ($answer !== 'y') {
+                    $this->message = 'Quit cancelled';
+                    return;
+                }
+                break;
+            }
+        }
+        $this->running = false;
+    }
+
+    private function findPrompt(): void
+    {
+        $query = $this->prompt('Find (%term ignores case): ', $this->lastFind);
+        if ($query === '') {
+            $this->message = 'Find cancelled';
+            return;
+        }
+        $this->lastFind = $query;
+        $this->findNext($query);
+    }
+
+    /**
+     * @return array{needle:string,ignoreCase:bool}
+     */
+    private function parseFindQuery(string $query): array
+    {
+        if (strlen($query) > 1 && $query[0] === '%') {
+            return ['needle' => substr($query, 1), 'ignoreCase' => true];
+        }
+
+        return ['needle' => $query, 'ignoreCase' => false];
+    }
+
+    private function findMatchPosition(string $line, string $needle, int $offset, bool $ignoreCase): int|false
+    {
+        if ($needle === '') {
+            return false;
+        }
+
+        if (!$ignoreCase) {
+            return strpos($line, $needle, $offset);
+        }
+
+        $slice = substr($line, $offset);
+        $pattern = '/' . preg_quote($needle, '/') . '/iu';
+        $matched = @preg_match($pattern, $slice, $matches, PREG_OFFSET_CAPTURE);
+        if ($matched === 1) {
+            return $offset + $matches[0][1];
+        }
+
+        return stripos($line, $needle, $offset);
+    }
+
+    private function replaceLineMatches(string $line, string $needle, string $replacement, bool $ignoreCase, int &$count): string
+    {
+        if (!$ignoreCase) {
+            return str_replace($needle, $replacement, $line, $count);
+        }
+
+        $pattern = '/' . preg_quote($needle, '/') . '/iu';
+        $result = @preg_replace_callback($pattern, static fn (): string => $replacement, $line, -1, $count);
+        if ($result !== null) {
+            return $result;
+        }
+
+        $pattern = '/' . preg_quote($needle, '/') . '/i';
+        return preg_replace_callback($pattern, static fn (): string => $replacement, $line, -1, $count) ?? $line;
+    }
+
+    private function findNext(string $query): bool
+    {
+        ['needle' => $needle, 'ignoreCase' => $ignoreCase] = $this->parseFindQuery($query);
+        if ($needle === '') {
+            $this->message = 'Find needs a keyword after %';
+            return false;
+        }
+
+        $tab = $this->tab();
+        $count = count($tab->lines);
+        if ($count === 0) {
+            return false;
+        }
+
+        for ($pass = 0; $pass < 2; $pass++) {
+            $startLine = $pass === 0 ? $tab->cursorLine : 0;
+            $endLine = $pass === 0 ? $count - 1 : $tab->cursorLine;
+            for ($line = $startLine; $line <= $endLine; $line++) {
+                $offset = ($pass === 0 && $line === $tab->cursorLine) ? $tab->cursorCol + 1 : 0;
+                $pos = $this->findMatchPosition($tab->lines[$line], $needle, $offset, $ignoreCase);
+                if ($pos !== false) {
+                    $tab->cursorLine = $line;
+                    $tab->cursorCol = $pos;
+                    $this->selectionAnchor = ['line' => $line, 'col' => $pos + strlen($needle)];
+                    $this->message = 'Found: ' . $needle . ($ignoreCase ? ' (ignore case)' : '');
+                    return true;
+                }
+            }
+        }
+
+        $this->message = 'Not found: ' . $needle . ($ignoreCase ? ' (ignore case)' : '');
+        return false;
+    }
+
+    private function replacePrompt(): void
+    {
+        $query = $this->prompt('Find (%term ignores case): ', $this->lastFind);
+        if ($this->promptCancelled || $query === '') {
+            $this->message = 'Replace cancelled';
+            return;
+        }
+        ['needle' => $needle] = $this->parseFindQuery($query);
+        if ($needle === '') {
+            $this->message = 'Replace needs a keyword after %';
+            return;
+        }
+        $replacement = $this->prompt('Replace with: ');
+        if ($this->promptCancelled) {
+            $this->message = 'Replace cancelled';
+            return;
+        }
+        $mode = strtolower($this->prompt('Replace one or all? [o/a]: ', 'o'));
+        if ($this->promptCancelled || $mode === '') {
+            $this->message = 'Replace cancelled';
+            return;
+        }
+        $this->lastFind = $query;
+        if ($mode === 'a') {
+            $this->replaceAll($query, $replacement);
+        } else {
+            $this->replaceOne($query, $replacement);
+        }
+    }
+
+    private function replaceOne(string $query, string $replacement): void
+    {
+        ['needle' => $needle, 'ignoreCase' => $ignoreCase] = $this->parseFindQuery($query);
+        if (!$this->findNext($query)) {
+            return;
+        }
+        $tab = $this->tab();
+        $line = $tab->cursorLine;
+        $col = $tab->cursorCol;
+        $this->recordUndoState();
+        $tab->lines[$line] = substr($tab->lines[$line], 0, $col) . $replacement . substr($tab->lines[$line], $col + strlen($needle));
+        $tab->cursorCol = $col + strlen($replacement);
+        $this->markEdited($tab);
+        $this->clearSelection();
+        $this->message = 'Replaced one match' . ($ignoreCase ? ' (ignore case)' : '');
+    }
+
+    private function replaceAll(string $query, string $replacement): void
+    {
+        ['needle' => $needle, 'ignoreCase' => $ignoreCase] = $this->parseFindQuery($query);
+        if ($needle === '') {
+            $this->message = 'Replace needs a keyword after %';
+            return;
+        }
+
+        $tab = $this->tab();
+        $changed = 0;
+        $newLines = $tab->lines;
+        foreach ($newLines as $i => $line) {
+            $count = 0;
+            $newLines[$i] = $this->replaceLineMatches($line, $needle, $replacement, $ignoreCase, $count);
+            $changed += $count;
+        }
+        if ($changed > 0) {
+            $this->recordUndoState();
+            $tab->lines = $newLines;
+            $this->markEdited($tab);
+        }
+        $this->clearSelection();
+        $this->message = "Replaced {$changed} match" . ($changed === 1 ? '' : 'es') . ($ignoreCase ? ' (ignore case)' : '');
+    }
+
+    private function moveCursor(int $lineDelta, int $colDelta, bool $select): void
+    {
+        $tab = $this->tab();
+        $this->prepareSelection($select);
+        $tab->cursorLine = max(0, min(count($tab->lines) - 1, $tab->cursorLine + $lineDelta));
+        $tab->cursorCol = $this->clampByteCol($tab->lines[$tab->cursorLine], $tab->cursorCol + $colDelta);
+    }
+
+    private function moveLeft(bool $select): void
+    {
+        $tab = $this->tab();
+        $this->prepareSelection($select);
+        if ($tab->cursorCol > 0) {
+            $tab->cursorCol = $this->prevCharOffset($tab->lines[$tab->cursorLine], $tab->cursorCol);
+        } elseif ($tab->cursorLine > 0) {
+            $tab->cursorLine--;
+            $tab->cursorCol = strlen($tab->lines[$tab->cursorLine]);
+        }
+    }
+
+    private function moveRight(bool $select): void
+    {
+        $tab = $this->tab();
+        $this->prepareSelection($select);
+        if ($tab->cursorCol < strlen($tab->lines[$tab->cursorLine])) {
+            $tab->cursorCol = $this->nextCharOffset($tab->lines[$tab->cursorLine], $tab->cursorCol);
+        } elseif ($tab->cursorLine < count($tab->lines) - 1) {
+            $tab->cursorLine++;
+            $tab->cursorCol = 0;
+        }
+    }
+
+    private function home(bool $select): void
+    {
+        $this->prepareSelection($select);
+        $this->tab()->cursorCol = 0;
+    }
+
+    private function end(bool $select): void
+    {
+        $this->prepareSelection($select);
+        $tab = $this->tab();
+        $tab->cursorCol = strlen($tab->lines[$tab->cursorLine]);
+    }
+
+    private function page(int $direction, bool $select): void
+    {
+        $this->prepareSelection($select);
+        $tab = $this->tab();
+        $tab->cursorLine = max(0, min(count($tab->lines) - 1, $tab->cursorLine + ($direction * $this->contentHeight)));
+        $tab->cursorCol = $this->clampByteCol($tab->lines[$tab->cursorLine], $tab->cursorCol);
+    }
+
+    private function prepareSelection(bool $select): void
+    {
+        if ($select) {
+            if ($this->selectionAnchor === null) {
+                $tab = $this->tab();
+                $this->selectionAnchor = ['line' => $tab->cursorLine, 'col' => $tab->cursorCol];
+            }
+        } else {
+            $this->clearSelection();
+        }
+    }
+
+    private function clearSelection(): void
+    {
+        $this->selectionAnchor = null;
+    }
+
+    private function insertText(string $text): void
+    {
+        $this->beginUndoGroup();
+        try {
+            $this->deleteSelectionIfAny();
+            $text = str_replace(["\r\n", "\r"], "\n", $text);
+            $parts = explode("\n", $text);
+            foreach ($parts as $i => $part) {
+                if ($i > 0) {
+                    $this->insertNewline(false);
+                }
+                if ($part !== '') {
+                    $this->insertPlainText($part);
+                }
+            }
+        } finally {
+            $this->endUndoGroup();
+        }
+    }
+
+    private function insertPlainText(string $text): void
+    {
+        $tab = $this->tab();
+        $this->recordUndoState();
+        $line = $tab->lines[$tab->cursorLine];
+        $tab->lines[$tab->cursorLine] = substr($line, 0, $tab->cursorCol) . $text . substr($line, $tab->cursorCol);
+        $tab->cursorCol += strlen($text);
+        $this->markEdited($tab);
+    }
+
+    private function insertNewline(bool $deleteSelection = true): void
+    {
+        $groupStarted = false;
+        if ($deleteSelection) {
+            $this->beginUndoGroup();
+            $groupStarted = true;
+        }
+
+        try {
+            if ($deleteSelection) {
+                $this->deleteSelectionIfAny();
+            }
+            $tab = $this->tab();
+            $this->recordUndoState();
+            $line = $tab->lines[$tab->cursorLine];
+            $before = substr($line, 0, $tab->cursorCol);
+            $after = substr($line, $tab->cursorCol);
+            $tab->lines[$tab->cursorLine] = $before;
+            array_splice($tab->lines, $tab->cursorLine + 1, 0, [$after]);
+            $tab->cursorLine++;
+            $tab->cursorCol = 0;
+            $this->markEdited($tab);
+        } finally {
+            if ($groupStarted) {
+                $this->endUndoGroup();
+            }
+        }
+    }
+
+    private function backspace(): void
+    {
+        if ($this->deleteSelectionIfAny()) {
+            return;
+        }
+        $tab = $this->tab();
+        if ($tab->cursorCol > 0) {
+            $this->recordUndoState();
+            $line = $tab->lines[$tab->cursorLine];
+            $prev = $this->prevCharOffset($line, $tab->cursorCol);
+            $tab->lines[$tab->cursorLine] = substr($line, 0, $prev) . substr($line, $tab->cursorCol);
+            $tab->cursorCol = $prev;
+            $this->markEdited($tab);
+        } elseif ($tab->cursorLine > 0) {
+            $this->recordUndoState();
+            $prevLen = strlen($tab->lines[$tab->cursorLine - 1]);
+            $tab->lines[$tab->cursorLine - 1] .= $tab->lines[$tab->cursorLine];
+            array_splice($tab->lines, $tab->cursorLine, 1);
+            $tab->cursorLine--;
+            $tab->cursorCol = $prevLen;
+            $this->markEdited($tab);
+        }
+    }
+
+    private function deleteForward(): void
+    {
+        if ($this->deleteSelectionIfAny()) {
+            return;
+        }
+        $tab = $this->tab();
+        $line = $tab->lines[$tab->cursorLine];
+        if ($tab->cursorCol < strlen($line)) {
+            $this->recordUndoState();
+            $next = $this->nextCharOffset($line, $tab->cursorCol);
+            $tab->lines[$tab->cursorLine] = substr($line, 0, $tab->cursorCol) . substr($line, $next);
+            $this->markEdited($tab);
+        } elseif ($tab->cursorLine < count($tab->lines) - 1) {
+            $this->recordUndoState();
+            $tab->lines[$tab->cursorLine] .= $tab->lines[$tab->cursorLine + 1];
+            array_splice($tab->lines, $tab->cursorLine + 1, 1);
+            $this->markEdited($tab);
+        }
+    }
+
+    private function deleteCurrentLine(): void
+    {
+        $tab = $this->tab();
+        $this->recordUndoState();
+        if (count($tab->lines) === 1) {
+            $tab->lines[0] = '';
+            $tab->cursorLine = 0;
+            $tab->cursorCol = 0;
+        } else {
+            array_splice($tab->lines, $tab->cursorLine, 1);
+            $tab->cursorLine = min($tab->cursorLine, count($tab->lines) - 1);
+            $tab->cursorCol = $this->clampByteCol($tab->lines[$tab->cursorLine], $tab->cursorCol);
+        }
+        $this->markEdited($tab);
+        $this->clearSelection();
+        $this->message = 'Line deleted';
+    }
+
+    private function copySelectionOrLine(): void
+    {
+        $text = $this->selectedText();
+        if ($text === null) {
+            $tab = $this->tab();
+            $text = $tab->lines[$tab->cursorLine] . "\n";
+        }
+        $this->clipboard = $text;
+        $this->copyToSystemClipboard($text);
+        $this->message = 'Copied';
+    }
+
+    private function cutSelectionOrLine(): void
+    {
+        $text = $this->selectedText();
+        if ($text !== null) {
+            $this->clipboard = $text;
+            $this->copyToSystemClipboard($text);
+            $this->deleteSelectionIfAny();
+            $this->message = 'Cut selection';
+            return;
+        }
+
+        $tab = $this->tab();
+        $this->clipboard = $tab->lines[$tab->cursorLine] . "\n";
+        $this->copyToSystemClipboard($this->clipboard);
+        $this->deleteCurrentLine();
+        $this->message = 'Cut line';
+    }
+
+    private function pasteClipboard(): void
+    {
+        if ($this->clipboard === '') {
+            $this->message = 'Internal clipboard is empty';
+            return;
+        }
+        $this->insertText($this->clipboard);
+        $this->message = 'Pasted';
+    }
+
+    private function selectAll(): void
+    {
+        $tab = $this->tab();
+        $this->selectionAnchor = ['line' => 0, 'col' => 0];
+        $tab->cursorLine = count($tab->lines) - 1;
+        $tab->cursorCol = strlen($tab->lines[$tab->cursorLine]);
+        $this->message = 'Selected all';
+    }
+
+    private function selectedText(): ?string
+    {
+        $range = $this->selectionRange();
+        if (!$range) {
+            return null;
+        }
+        $tab = $this->tab();
+        [$sl, $sc, $el, $ec] = $range;
+        if ($sl === $el) {
+            return substr($tab->lines[$sl], $sc, $ec - $sc);
+        }
+        $parts = [];
+        $parts[] = substr($tab->lines[$sl], $sc);
+        for ($i = $sl + 1; $i < $el; $i++) {
+            $parts[] = $tab->lines[$i];
+        }
+        $parts[] = substr($tab->lines[$el], 0, $ec);
+        return implode("\n", $parts);
+    }
+
+    private function deleteSelectionIfAny(): bool
+    {
+        $range = $this->selectionRange();
+        if (!$range) {
+            return false;
+        }
+        $tab = $this->tab();
+        $this->recordUndoState();
+        [$sl, $sc, $el, $ec] = $range;
+        if ($sl === $el) {
+            $tab->lines[$sl] = substr($tab->lines[$sl], 0, $sc) . substr($tab->lines[$sl], $ec);
+        } else {
+            $first = substr($tab->lines[$sl], 0, $sc);
+            $last = substr($tab->lines[$el], $ec);
+            array_splice($tab->lines, $sl, $el - $sl + 1, [$first . $last]);
+        }
+        $tab->cursorLine = $sl;
+        $tab->cursorCol = $sc;
+        $this->markEdited($tab);
+        $this->clearSelection();
+        return true;
+    }
+
+    private function selectionRange(): ?array
+    {
+        if ($this->selectionAnchor === null) {
+            return null;
+        }
+        $tab = $this->tab();
+        $aLine = $this->selectionAnchor['line'];
+        $aCol = $this->selectionAnchor['col'];
+        $bLine = $tab->cursorLine;
+        $bCol = $tab->cursorCol;
+        if ($aLine === $bLine && $aCol === $bCol) {
+            return null;
+        }
+        if ($aLine > $bLine || ($aLine === $bLine && $aCol > $bCol)) {
+            return [$bLine, $bCol, $aLine, $aCol];
+        }
+        return [$aLine, $aCol, $bLine, $bCol];
+    }
+
+    private function positionInRange(int $line, int $col, array $range): bool
+    {
+        [$sl, $sc, $el, $ec] = $range;
+        if ($line < $sl || $line > $el) {
+            return false;
+        }
+        if ($sl === $el) {
+            return $col >= $sc && $col < $ec;
+        }
+        if ($line === $sl) {
+            return $col >= $sc;
+        }
+        if ($line === $el) {
+            return $col < $ec;
+        }
+        return true;
+    }
+
+    private function undo(): void
+    {
+        $tab = $this->tab();
+        $state = array_pop($tab->undoStack);
+        if ($state === null) {
+            $this->message = 'Nothing to undo';
+            return;
+        }
+
+        $tab->lines = $state['lines'];
+        if ($tab->lines === []) {
+            $tab->lines = [''];
+        }
+        $tab->cursorLine = max(0, min($state['cursorLine'], count($tab->lines) - 1));
+        $tab->cursorCol = $this->clampByteCol($tab->lines[$tab->cursorLine], $state['cursorCol']);
+        $tab->rowOffset = max(0, $state['rowOffset']);
+        $tab->colOffset = max(0, $state['colOffset']);
+        $tab->revision = $state['revision'];
+        $tab->modified = $tab->revision !== $tab->savedRevision;
+        $this->clearSelection();
+        $this->message = 'Undone';
+    }
+
+    private function beginUndoGroup(): void
+    {
+        $this->undoGroupActive = true;
+        $this->undoGroupCaptured = false;
+    }
+
+    private function endUndoGroup(): void
+    {
+        $this->undoGroupActive = false;
+        $this->undoGroupCaptured = false;
+    }
+
+    private function recordUndoState(): void
+    {
+        if ($this->undoGroupActive && $this->undoGroupCaptured) {
+            return;
+        }
+
+        $tab = $this->tab();
+        $tab->undoStack[] = [
+            'lines' => $tab->lines,
+            'cursorLine' => $tab->cursorLine,
+            'cursorCol' => $tab->cursorCol,
+            'rowOffset' => $tab->rowOffset,
+            'colOffset' => $tab->colOffset,
+            'revision' => $tab->revision,
+        ];
+
+        if (count($tab->undoStack) > 200) {
+            array_shift($tab->undoStack);
+        }
+
+        if ($this->undoGroupActive) {
+            $this->undoGroupCaptured = true;
+        }
+    }
+
+    private function markEdited(AzTab $tab): void
+    {
+        $tab->revision++;
+        $tab->modified = $tab->revision !== $tab->savedRevision;
+    }
+
+    private function moveWordLeft(bool $select): void
+    {
+        $this->prepareSelection($select);
+        $tab = $this->tab();
+
+        if ($tab->cursorCol === 0 && $tab->cursorLine === 0) {
+            return;
+        }
+
+        if ($tab->cursorCol === 0) {
+            $tab->cursorLine--;
+            $tab->cursorCol = strlen($tab->lines[$tab->cursorLine]);
+        }
+
+        $line = $tab->lines[$tab->cursorLine];
+        while ($tab->cursorCol > 0) {
+            $prev = $this->prevCharOffset($line, $tab->cursorCol);
+            $char = substr($line, $prev, $tab->cursorCol - $prev);
+            if (!$this->isHorizontalWhitespace($char)) {
+                break;
+            }
+            $tab->cursorCol = $prev;
+        }
+
+        if ($tab->cursorCol === 0) {
+            return;
+        }
+
+        $prev = $this->prevCharOffset($line, $tab->cursorCol);
+        $word = $this->isWordChar(substr($line, $prev, $tab->cursorCol - $prev));
+        while ($tab->cursorCol > 0) {
+            $prev = $this->prevCharOffset($line, $tab->cursorCol);
+            $char = substr($line, $prev, $tab->cursorCol - $prev);
+            if ($this->isHorizontalWhitespace($char) || $this->isWordChar($char) !== $word) {
+                break;
+            }
+            $tab->cursorCol = $prev;
+        }
+    }
+
+    private function moveWordRight(bool $select): void
+    {
+        $this->prepareSelection($select);
+        $tab = $this->tab();
+
+        while (true) {
+            $line = $tab->lines[$tab->cursorLine];
+            $len = strlen($line);
+
+            while ($tab->cursorCol < $len) {
+                $char = $this->utf8CharAt($line, $tab->cursorCol);
+                if (!$this->isHorizontalWhitespace($char)) {
+                    break;
+                }
+                $tab->cursorCol = $this->nextCharOffset($line, $tab->cursorCol);
+            }
+
+            if ($tab->cursorCol < $len) {
+                $word = $this->isWordChar($this->utf8CharAt($line, $tab->cursorCol));
+                while ($tab->cursorCol < $len) {
+                    $char = $this->utf8CharAt($line, $tab->cursorCol);
+                    if ($this->isHorizontalWhitespace($char) || $this->isWordChar($char) !== $word) {
+                        break;
+                    }
+                    $tab->cursorCol = $this->nextCharOffset($line, $tab->cursorCol);
+                }
+                return;
+            }
+
+            if ($tab->cursorLine >= count($tab->lines) - 1) {
+                return;
+            }
+
+            $tab->cursorLine++;
+            $tab->cursorCol = 0;
+        }
+    }
+
+    private function isWordChar(string $char): bool
+    {
+        return $char === '_' || preg_match('/^[\\p{L}\\p{N}]$/u', $char) === 1;
+    }
+
+    private function isHorizontalWhitespace(string $char): bool
+    {
+        return $char === ' ' || $char === "\t";
+    }
+
+    private function copyToSystemClipboard(string $text): void
+    {
+        // OSC 52 works in many terminals and safely does nothing in others.
+        $encoded = base64_encode($text);
+        fwrite(STDOUT, "\033]52;c;{$encoded}\007");
+    }
+
+    private function prompt(string $label, string $default = ''): string
+    {
+        $this->promptCancelled = false;
+        $value = $default;
+        while (true) {
+            // Render the full editor frame, but override the status bar
+            // with an orange-highlighted input field so the user clearly sees
+            // where they are typing.
+            $this->message = '__PROMPT__';  // sentinel; renderStatusLine checks this
+            $this->promptLabel = $label;
+            $this->promptValue = $value;
+            $this->render();
+            $this->message = '';
+
+            // Position cursor right after the label inside the orange input area.
+            // The prompt bar is rendered on the bottom status row.
+            // It starts with " az> " (5 chars) then the label, then the value.
+            $statusRow = $this->statusLine;
+            $cursorCol = 6 + strlen($label) + strlen($value); // 1-based terminal col
+            $cursorCol = max(1, min($this->cols, $cursorCol));
+            fwrite(STDOUT, "\033[{$statusRow};{$cursorCol}H\033[?25h");
+
+            $key = $this->readKey();
+            if ($key === "\r" || $key === "\n") {
+                $this->promptLabel = null;
+                $this->promptValue = null;
+                $this->promptCancelled = false;
+                return $value;
+            }
+            if ($key === "\033") {
+                $this->promptLabel = null;
+                $this->promptValue = null;
+                $this->promptCancelled = true;
+                return '';
+            }
+            if ($key === "\177" || $key === "\x08") {
+                $value = $this->removeLastUtf8Char($value);
+                continue;
+            }
+            if ($key === "\x15") { // Ctrl+U clears field
+                $value = '';
+                continue;
+            }
+            if ($this->isPrintable($key)) {
+                $value .= $key;
+            }
+        }
+    }
+
+    private function switchToTabNumber(int $number): void
+    {
+        $visible = $this->visibleTabIndexes();
+        $visibleOffset = $number - 1;
+        if (isset($visible[$visibleOffset])) {
+            $this->tabIndex = $visible[$visibleOffset];
+            $this->clearSelection();
+            $this->message = 'Tab ' . $number;
+        } else {
+            $this->message = 'No tab ' . $number;
+        }
+    }
+
+    private function tabShortcutNumber(string $key): ?int
+    {
+        if (preg_match('/^\033\[(4[9]|5[0-7]);5u$/', $key, $m)) {
+            $code = (int) $m[1];
+            return $code - 48;
+        }
+        if (preg_match('/^\033([1-9])$/', $key, $m)) {
+            return (int) $m[1]; // Alt+number fallback
+        }
+        return null;
+    }
+
+    private function isCtrlShiftLetter(string $key, string $letter): bool
+    {
+        $upper = ord(strtoupper($letter));
+        $lower = ord(strtolower($letter));
+        if (preg_match('/^\033\[(\d+);6u$/', $key, $m)) {
+            $code = (int) $m[1];
+            return $code === $upper || $code === $lower;
+        }
+        return false;
+    }
+
+    private function isCtrlQuestion(string $key): bool
+    {
+        return $key === "\x1f"
+            || $key === "\033[47;5u"
+            || $key === "\033[63;5u"
+            || preg_match('/^\033\[(?:47|63);5u$/', $key) === 1;
+    }
+
+    private function isCtrlLeft(string $key): bool
+    {
+        return in_array($key, ["\033[1;5D", "\033[5D", "\033O5D", "\033Od", "\033[D;5"], true)
+            || preg_match('/^\033\[(?:1;5|5|1;3|3)D$/', $key) === 1
+            || preg_match('/^\033\[(?:68|57419);5u$/', $key) === 1;
+    }
+
+    private function isCtrlRight(string $key): bool
+    {
+        return in_array($key, ["\033[1;5C", "\033[5C", "\033O5C", "\033Oc", "\033[C;5"], true)
+            || preg_match('/^\033\[(?:1;5|5|1;3|3)C$/', $key) === 1
+            || preg_match('/^\033\[(?:67|57421);5u$/', $key) === 1;
+    }
+
+    private function isCtrlShiftLeft(string $key): bool
+    {
+        return $key === "\033[1;6D" || preg_match('/^\033\[68;6u$/', $key) === 1;
+    }
+
+    private function isCtrlShiftRight(string $key): bool
+    {
+        return $key === "\033[1;6C" || preg_match('/^\033\[67;6u$/', $key) === 1;
+    }
+
+    private function isCtrlBackspace(string $key): bool
+    {
+        return $key === "\x17" || $key === "\033[127;5u" || $key === "\033[8;5u";
+    }
+
+    private function isPrintable(string $key): bool
+    {
+        if ($key === "\t") {
+            return true;
+        }
+        if ($key === '' || $key[0] === "\033") {
+            return false;
+        }
+        if (strlen($key) === 1) {
+            $ord = ord($key);
+            return $ord >= 32 && $ord !== 127;
+        }
+        return $this->isValidUtf8($key) && !$this->containsControlChars($key);
+    }
+
+    private function handleAutocompleteKey(string $key): bool
+    {
+        if ($key === "\t") {
+            if ($this->autocompleteVisible) {
+                $this->acceptAutocomplete();
+                return true;
+            }
+            if ($this->refreshAutocomplete(true)) {
+                return true;
+            }
+            $this->insertText("\t");
+            return true;
+        }
+
+        if (!$this->autocompleteVisible) {
+            return false;
+        }
+
+        if ($key === "\r" || $key === "\n") {
+            $this->acceptAutocomplete();
+            return true;
+        }
+
+        if ($key === "\033") {
+            $this->closeAutocomplete();
+            $this->message = 'Autocomplete closed';
+            return true;
+        }
+
+        if ($key === "\033[A") {
+            $this->autocompleteIndex = max(0, $this->autocompleteIndex - 1);
+            return true;
+        }
+
+        if ($key === "\033[B") {
+            $this->autocompleteIndex = min(count($this->autocompleteSuggestions) - 1, $this->autocompleteIndex + 1);
+            return true;
+        }
+
+        return false;
+    }
+
+    private function refreshAutocomplete(bool $explicit = false): bool
+    {
+        $context = $this->autocompleteContext($explicit);
+        if ($context === null) {
+            $this->closeAutocomplete();
+            return false;
+        }
+
+        $suggestions = $this->autocompleteSuggestionsForContext($context);
+        if (!$suggestions) {
+            $this->closeAutocomplete();
+            return false;
+        }
+
+        $tab = $this->tab();
+        $this->autocompleteVisible = true;
+        $this->autocompleteSuggestions = $suggestions;
+        $this->autocompleteIndex = 0;
+        $this->autocompleteLine = $tab->cursorLine;
+        $this->autocompleteStartCol = (int) $context['start'];
+        $this->autocompletePrefix = (string) $context['prefix'];
+        return true;
+    }
+
+    private function closeAutocomplete(): void
+    {
+        $this->autocompleteVisible = false;
+        $this->autocompleteSuggestions = [];
+        $this->autocompleteIndex = 0;
+        $this->autocompletePrefix = '';
+    }
+
+    private function acceptAutocomplete(): void
+    {
+        if (!$this->autocompleteVisible || !isset($this->autocompleteSuggestions[$this->autocompleteIndex])) {
+            $this->closeAutocomplete();
+            return;
+        }
+
+        $tab = $this->tab();
+        if ($tab->cursorLine !== $this->autocompleteLine) {
+            $this->closeAutocomplete();
+            return;
+        }
+
+        $item = $this->autocompleteSuggestions[$this->autocompleteIndex];
+        $line = $tab->lines[$tab->cursorLine];
+        $start = $this->clampByteCol($line, $this->autocompleteStartCol);
+        $end = $this->clampByteCol($line, $tab->cursorCol);
+        if ($start > $end) {
+            $this->closeAutocomplete();
+            return;
+        }
+
+        $this->recordUndoState();
+        $tab->lines[$tab->cursorLine] = substr($line, 0, $start) . $item['insert'] . substr($line, $end);
+        $tab->cursorCol = $start + strlen($item['insert']);
+        $this->markEdited($tab);
+        $this->clearSelection();
+        $this->message = 'Completed ' . $item['label'];
+        $this->closeAutocomplete();
+    }
+
+    private function autocompleteContext(bool $explicit = false): ?array
+    {
+        $tab = $this->tab();
+        $syntax = $this->syntaxForPath($tab->path);
+        $line = $tab->lines[$tab->cursorLine] ?? '';
+        $cursor = $this->clampByteCol($line, $tab->cursorCol);
+        $before = substr($line, 0, $cursor);
+
+        if ($syntax === 'blade' && preg_match('/(@[A-Za-z]*)$/u', $before, $m, PREG_OFFSET_CAPTURE)) {
+            $token = $m[1][0];
+            return ['mode' => 'blade-directive', 'prefix' => $token, 'start' => $cursor - strlen($token)];
+        }
+
+        if (($syntax === 'html' || $syntax === 'blade') && preg_match('/<\/?([A-Za-z][A-Za-z0-9:-]*)?$/u', $before, $m, PREG_OFFSET_CAPTURE)) {
+            $prefix = isset($m[1]) ? $m[1][0] : '';
+            if ($explicit || $prefix !== '' || str_ends_with($before, '<') || str_ends_with($before, '</')) {
+                return ['mode' => 'html-tag', 'prefix' => $prefix, 'start' => $cursor - strlen($prefix)];
+            }
+        }
+
+        if (($syntax === 'html' || $syntax === 'blade') && $this->isInsideHtmlTag($before)) {
+            if (preg_match('/(?:^|\s)([A-Za-z_:][A-Za-z0-9_:\-]*)$/u', $before, $m, PREG_OFFSET_CAPTURE)) {
+                $prefix = $m[1][0];
+                if ($explicit || strlen($prefix) > 0) {
+                    return ['mode' => 'html-attr', 'prefix' => $prefix, 'start' => $cursor - strlen($prefix)];
+                }
+            }
+        }
+
+        if ($syntax === 'css' || $this->looksLikeCssContext($syntax, $before)) {
+            if (preg_match('/(@?[A-Za-z_-][A-Za-z0-9_-]*)$/u', $before, $m, PREG_OFFSET_CAPTURE)) {
+                $prefix = $m[1][0];
+                return ['mode' => str_starts_with($prefix, '@') ? 'css-at-rule' : 'css', 'prefix' => $prefix, 'start' => $cursor - strlen($prefix)];
+            }
+        }
+
+        if ($syntax === 'php' || $syntax === 'blade') {
+            if (preg_match('/(\$[A-Za-z_][A-Za-z0-9_]*)$/u', $before, $m, PREG_OFFSET_CAPTURE)) {
+                $prefix = $m[1][0];
+                return ['mode' => 'php-variable', 'prefix' => $prefix, 'start' => $cursor - strlen($prefix)];
+            }
+            if (preg_match('/([A-Za-z_][A-Za-z0-9_]*)$/u', $before, $m, PREG_OFFSET_CAPTURE)) {
+                $prefix = $m[1][0];
+                return ['mode' => 'php', 'prefix' => $prefix, 'start' => $cursor - strlen($prefix)];
+            }
+        }
+
+        return null;
+    }
+
+    private function isInsideHtmlTag(string $before): bool
+    {
+        $lt = strrpos($before, '<');
+        if ($lt === false) {
+            return false;
+        }
+        $gt = strrpos($before, '>');
+        return $gt === false || $gt < $lt;
+    }
+
+    private function looksLikeCssContext(string $syntax, string $before): bool
+    {
+        if ($syntax !== 'html' && $syntax !== 'blade') {
+            return false;
+        }
+        return strripos($before, 'style="') !== false || strripos($before, "style='") !== false;
+    }
+
+    private function autocompleteSuggestionsForContext(array $context): array
+    {
+        $mode = (string) $context['mode'];
+        $prefix = (string) $context['prefix'];
+
+        if ($mode === 'html-tag') {
+            return $this->filterAutocompleteItems($this->htmlAutocompleteTags(), $prefix, 'tag');
+        }
+        if ($mode === 'html-attr') {
+            return $this->filterAutocompleteItems($this->htmlAutocompleteAttributes(), $prefix, 'attribute');
+        }
+        if ($mode === 'css-at-rule') {
+            return $this->filterAutocompleteItems($this->cssAutocompleteAtRules(), $prefix, 'at-rule');
+        }
+        if ($mode === 'css') {
+            return $this->filterAutocompleteItems(array_merge($this->cssAutocompleteProperties(), $this->cssAutocompleteValues()), $prefix, 'css');
+        }
+        if ($mode === 'blade-directive') {
+            return $this->filterAutocompleteItems($this->bladeAutocompleteDirectives(), $prefix, 'blade');
+        }
+        if ($mode === 'php-variable') {
+            return $this->filterAutocompleteItems($this->phpAutocompleteVariables(), $prefix, 'variable');
+        }
+        if ($mode === 'php') {
+            return $this->filterAutocompleteItems(array_merge($this->phpAutocompleteKeywords(), $this->phpAutocompleteFunctions(), $this->phpAutocompleteSymbols()), $prefix, 'php');
+        }
+
+        return [];
+    }
+
+    private function filterAutocompleteItems(array $items, string $prefix, string $defaultType): array
+    {
+        $out = [];
+        $seen = [];
+        $prefixLower = strtolower($prefix);
+
+        foreach ($items as $item) {
+            if (is_string($item)) {
+                $item = ['label' => $item, 'insert' => $item, 'detail' => $defaultType, 'type' => $defaultType];
+            }
+
+            $label = (string) ($item['label'] ?? $item['insert'] ?? '');
+            $insert = (string) ($item['insert'] ?? $label);
+            if ($label === '' || $insert === '') {
+                continue;
+            }
+
+            if ($prefixLower !== '' && !str_starts_with(strtolower($label), $prefixLower) && !str_starts_with(strtolower($insert), $prefixLower)) {
+                continue;
+            }
+            if ($insert === $prefix) {
+                continue;
+            }
+
+            $key = strtolower($insert . "\0" . $label);
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
+            $out[] = [
+                'label' => $label,
+                'insert' => $insert,
+                'detail' => (string) ($item['detail'] ?? $defaultType),
+                'type' => (string) ($item['type'] ?? $defaultType),
+            ];
+            if (count($out) >= 60) {
+                break;
+            }
+        }
+
+        usort($out, function (array $a, array $b) use ($prefixLower): int {
+            $aExact = strtolower($a['label']) === $prefixLower || strtolower($a['insert']) === $prefixLower;
+            $bExact = strtolower($b['label']) === $prefixLower || strtolower($b['insert']) === $prefixLower;
+            if ($aExact !== $bExact) {
+                return $aExact ? -1 : 1;
+            }
+            return strcasecmp($a['label'], $b['label']);
+        });
+
+        return $out;
+    }
+
+    private function renderAutocompleteDropdown(int $cursorRow, int $cursorCol): string
+    {
+        if (!$this->autocompleteVisible || !$this->autocompleteSuggestions) {
+            return '';
+        }
+
+        $count = count($this->autocompleteSuggestions);
+        $maxItems = min(8, $count);
+        $first = max(0, min($this->autocompleteIndex - 3, $count - $maxItems));
+        $visible = array_slice($this->autocompleteSuggestions, $first, $maxItems, true);
+
+        $width = 18;
+        foreach ($visible as $item) {
+            $width = max($width, $this->visualWidth($item['label'] . '  ' . $item['detail']) + 2);
+        }
+        $width = min(max(18, $width), min(48, $this->editorWidth));
+
+        $startCol = max($this->editorStartCol(), min($cursorCol, $this->cols - $width + 1));
+        $startRow = $cursorRow + 1;
+        if ($startRow + $maxItems > $this->statusLine) {
+            $startRow = max(2, $cursorRow - $maxItems);
+        }
+
+        $out = '';
+        $row = $startRow;
+        foreach ($visible as $idx => $item) {
+            if ($row >= $this->statusLine) {
+                break;
+            }
+            $labelWidth = max(1, $width - 13);
+            $label = $this->truncatePlain($item['label'], $labelWidth);
+            $detail = $this->truncatePlain($item['detail'], 10);
+            $text = ' ' . $label . str_repeat(' ', max(1, $width - $this->visualWidth($label) - $this->visualWidth($detail) - 2)) . $detail . ' ';
+            $style = ($idx === $this->autocompleteIndex) ? "\033[48;5;208m\033[30m" : "\033[48;5;236m\033[37m";
+            $out .= "\033[{$row};{$startCol}H" . $style . $this->fitPlain($text, $width) . "\033[0m";
+            $row++;
+        }
+
+        return $out;
+    }
+
+    private function htmlAutocompleteTags(): array
+    {
+        return ['a','abbr','address','area','article','aside','audio','b','base','bdi','bdo','blockquote','body','br','button','canvas','caption','cite','code','col','colgroup','data','datalist','dd','del','details','dfn','dialog','div','dl','dt','em','embed','fieldset','figcaption','figure','footer','form','h1','h2','h3','h4','h5','h6','head','header','hr','html','i','iframe','img','input','ins','kbd','label','legend','li','link','main','map','mark','meta','meter','nav','noscript','object','ol','optgroup','option','output','p','picture','pre','progress','q','rp','rt','ruby','s','samp','script','section','select','slot','small','source','span','strong','style','sub','summary','sup','svg','table','tbody','td','template','textarea','tfoot','th','thead','time','title','tr','track','u','ul','var','video','wbr'];
+    }
+
+    private function htmlAutocompleteAttributes(): array
+    {
+        return ['accept','action','alt','aria-label','async','autocomplete','autofocus','checked','class','cols','colspan','content','contenteditable','data-','defer','disabled','download','draggable','enctype','for','height','hidden','href','id','lang','loading','max','maxlength','method','min','multiple','name','pattern','placeholder','rel','required','role','rows','rowspan','selected','src','style','tabindex','target','title','type','value','width'];
+    }
+
+    private function cssAutocompleteProperties(): array
+    {
+        return ['align-content','align-items','align-self','animation','animation-delay','animation-duration','animation-name','appearance','aspect-ratio','backdrop-filter','background','background-attachment','background-color','background-image','background-position','background-repeat','background-size','border','border-bottom','border-bottom-color','border-bottom-left-radius','border-bottom-right-radius','border-box','border-collapse','border-color','border-left','border-radius','border-right','border-spacing','border-style','border-top','border-width','bottom','box-shadow','box-sizing','caption-side','clear','clip-path','color','column-gap','columns','contain','content','cursor','display','filter','flex','flex-basis','flex-direction','flex-flow','flex-grow','flex-shrink','flex-wrap','float','font','font-family','font-size','font-style','font-weight','gap','grid','grid-area','grid-auto-columns','grid-auto-flow','grid-auto-rows','grid-column','grid-template','grid-template-areas','grid-template-columns','grid-template-rows','height','inset','justify-content','justify-items','justify-self','left','letter-spacing','line-height','list-style','margin','margin-bottom','margin-left','margin-right','margin-top','max-height','max-width','min-height','min-width','object-fit','opacity','order','outline','overflow','overflow-x','overflow-y','padding','padding-bottom','padding-left','padding-right','padding-top','place-content','place-items','pointer-events','position','right','row-gap','scroll-behavior','text-align','text-decoration','text-overflow','text-transform','top','transform','transition','transition-duration','transition-property','translate','user-select','vertical-align','visibility','white-space','width','word-break','z-index'];
+    }
+
+    private function cssAutocompleteValues(): array
+    {
+        return ['absolute','auto','baseline','block','bold','border-box','both','center','column','contents','cover','fixed','flex','grid','hidden','inherit','initial','inline','inline-block','inline-flex','inline-grid','italic','left','none','normal','nowrap','pointer','relative','repeat','right','row','scroll','solid','space-around','space-between','space-evenly','sticky','transparent','underline','unset','visible','wrap'];
+    }
+
+    private function cssAutocompleteAtRules(): array
+    {
+        return ['@charset','@container','@font-face','@import','@keyframes','@layer','@media','@namespace','@page','@property','@scope','@supports'];
+    }
+
+    private function bladeAutocompleteDirectives(): array
+    {
+        return ['@auth','@aware','@break','@can','@cannot','@case','@choice','@class','@component','@continue','@csrf','@dd','@disabled','@each','@else','@elseif','@empty','@endauth','@endcan','@endcannot','@endcase','@endcomponent','@endempty','@endenv','@enderror','@endforeach','@endif','@endisset','@endonce','@endproduction','@endpush','@endsection','@endswitch','@endunless','@endwhile','@env','@error','@extends','@foreach','@forelse','@if','@include','@isset','@json','@lang','@method','@once','@php','@production','@props','@push','@section','@selected','@stack','@style','@switch','@unless','@vite','@while','@yield'];
+    }
+
+    private function phpAutocompleteKeywords(): array
+    {
+        return ['abstract','array','as','break','callable','case','catch','class','clone','const','continue','declare','default','do','echo','else','elseif','empty','enum','extends','final','finally','fn','for','foreach','function','global','goto','if','implements','include','include_once','instanceof','interface','isset','list','match','namespace','new','null','print','private','protected','public','readonly','require','require_once','return','static','switch','throw','trait','try','unset','use','while','yield','true','false','void','self','parent','int','string','float','bool','mixed','never','object'];
+    }
+
+    private function phpAutocompleteFunctions(): array
+    {
+        return ['array_filter','array_key_exists','array_keys','array_map','array_merge','array_pop','array_push','array_reduce','array_shift','array_slice','array_values','count','date','dirname','empty','explode','file_exists','file_get_contents','file_put_contents','htmlspecialchars','implode','in_array','is_array','is_dir','is_file','is_null','json_decode','json_encode','ltrim','mb_strlen','mb_substr','preg_match','preg_match_all','preg_replace','print_r','rtrim','sprintf','str_contains','str_ends_with','str_replace','str_starts_with','strlen','strpos','strtolower','strtoupper','substr','trim','var_dump'];
+    }
+
+    private function phpAutocompleteVariables(): array
+    {
+        $vars = ['$this','$_GET','$_POST','$_REQUEST','$_SERVER','$_SESSION','$_COOKIE','$_FILES','$_ENV'];
+        $text = implode("\n", $this->tab()->lines);
+        if (preg_match_all('/\$[A-Za-z_][A-Za-z0-9_]*/u', $text, $m)) {
+            $vars = array_merge($vars, $m[0]);
+        }
+        return array_values(array_unique($vars));
+    }
+
+    private function phpAutocompleteSymbols(): array
+    {
+        $symbols = [];
+        $text = implode("\n", $this->tab()->lines);
+        if (preg_match_all('/\b(?:function|class|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)/u', $text, $m)) {
+            $symbols = array_merge($symbols, $m[1]);
+        }
+        if (preg_match_all('/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/u', $text, $m)) {
+            $symbols = array_merge($symbols, $m[1]);
+        }
+        return array_values(array_unique($symbols));
+    }
+
+    private function highlightSegments(string $line, string $syntax): array
+    {
+        if ($syntax === 'html')  return $this->htmlSegments($line);
+        if ($syntax === 'css')   return $this->cssSegments($line);
+        if ($syntax === 'php')   return $this->phpSegments($line);
+        if ($syntax === 'blade') return $this->bladeSegments($line);
+        return [];
+    }
+
+    private function phpSegments(string $line): array
+    {
+        $segments = [];
+        // Comments first (highest priority, applied last so they win)
+        $this->addRegexSegments($segments, '/\/\/.*$/u', $line, "\033[90m");
+        $this->addRegexSegments($segments, '/\/\*.*?\*\//u', $line, "\033[90m");
+        $this->addRegexSegments($segments, '/#\[/u', $line, "\033[33m"); // attribute start
+        // Strings (double and single quoted, with escape handling)
+        $this->addRegexSegments($segments, '/("(?:[^"\\\\]|\\\\.)*"|\'(?:[^\'\\\\]|\\\\.)*\')/u', $line, "\033[32m");
+        // PHP open/close tags
+        $this->addRegexSegments($segments, '/<\?php\b|<\?=|\?>/u', $line, "\033[33m");
+        // Keywords
+        $kw = 'abstract|array|as|break|callable|case|catch|class|clone|const|continue|'
+            . 'declare|default|do|echo|else|elseif|empty|enum|extends|final|finally|fn|for|'
+            . 'foreach|function|global|goto|if|implements|include|include_once|instanceof|'
+            . 'interface|isset|list|match|namespace|new|null|print|private|protected|public|'
+            . 'readonly|require|require_once|return|static|switch|throw|trait|try|unset|use|'
+            . 'while|yield|true|false|void|self|parent|int|string|float|bool|mixed|never|object';
+        $this->addRegexSegments($segments, '/\\b(' . $kw . ')\\b/u', $line, "\033[35m");
+        // Class names (PascalCase)
+        $this->addRegexSegments($segments, '/\\b[A-Z][A-Za-z0-9_]*/u', $line, "\033[36m");
+        // Variables
+        $this->addRegexSegments($segments, '/\\$[a-zA-Z_][a-zA-Z0-9_]*/u', $line, "\033[33m");
+        // Numbers
+        $this->addRegexSegments($segments, '/\\b\\d+(?:\\.\\d+)?(?:e[+-]?\\d+)?\\b/u', $line, "\033[35m");
+        // Function calls
+        $this->addRegexSegments($segments, '/\\b([a-z_][a-zA-Z0-9_]*)(?=\\s*\\()/u', $line, "\033[34m");
+        return $segments;
+    }
+
+    private function bladeSegments(string $line): array
+    {
+        $segments = $this->phpSegments($line);
+        // Blade directives: @if, @foreach, @yield, @section etc.
+        $this->addRegexSegments($segments, '/@[a-zA-Z][a-zA-Z0-9]*/u', $line, "\033[35m");
+        // Blade echo: {{ ... }} and {!! ... !!}
+        $this->addRegexSegments($segments, '/\{\{--.*?--\}\}/u', $line, "\033[90m");
+        $this->addRegexSegments($segments, '/\{!!.*?!!\}/u', $line, "\033[33m");
+        $this->addRegexSegments($segments, '/\{\{.*?\}\}/u', $line, "\033[33m");
+        return $segments;
+    }
+
+    private function htmlSegments(string $line): array
+    {
+        $segments = [];
+        $this->addRegexSegments($segments, '/<!--.*?-->/u', $line, "\033[90m");
+        $this->addRegexSegments($segments, '/<\/?[A-Za-z][^>]*>/u', $line, "\033[36m");
+        $this->addRegexSegments($segments, '/("[^"]*"|\'[^\']*\')/u', $line, "\033[32m");
+        $this->addRegexSegments($segments, '/&[A-Za-z0-9#]+;/u', $line, "\033[35m");
+        return $segments;
+    }
+
+    private function cssSegments(string $line): array
+    {
+        $segments = [];
+        $this->addRegexSegments($segments, '/\/\*.*?\*\//u', $line, "\033[90m");
+        $this->addRegexSegments($segments, '/("[^"]*"|\'[^\']*\')/u', $line, "\033[32m");
+        $this->addRegexSegments($segments, '/@[A-Za-z_-]+/u', $line, "\033[35m");
+        $this->addRegexSegments($segments, '/[A-Za-z_-][A-Za-z0-9_-]*(?=\s*:)/u', $line, "\033[33m");
+        $this->addRegexSegments($segments, '/#[A-Fa-f0-9]{3,8}\b/u', $line, "\033[35m");
+        $this->addRegexSegments($segments, '/\b\d+(?:\.\d+)?(?:px|em|rem|vh|vw|%|s|ms)?\b/u', $line, "\033[35m");
+        if (strpos($line, '{') !== false) {
+            $pos = strpos($line, '{');
+            if ($pos !== false && $pos > 0) {
+                $segments[] = [0, $pos, "\033[36m"];
+            }
+        }
+        return $segments;
+    }
+
+    private function addRegexSegments(array &$segments, string $regex, string $line, string $color): void
+    {
+        if (preg_match_all($regex, $line, $matches, PREG_OFFSET_CAPTURE)) {
+            foreach ($matches[0] as $match) {
+                $text = $match[0];
+                $start = $match[1];
+                $segments[] = [$start, $start + strlen($text), $color];
+            }
+        }
+    }
+
+    private function colorAt(array $segments, int $pos): string
+    {
+        $color = '';
+        foreach ($segments as $seg) {
+            if ($pos >= $seg[0] && $pos < $seg[1]) {
+                $color = $seg[2];
+            }
+        }
+        return $color;
+    }
+
+    private function syntaxForPath(?string $path): string
+    {
+        if ($path === null) {
+            return 'plain';
+        }
+        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        if (in_array($ext, ['html', 'htm'], true)) {
+            return 'html';
+        }
+        if ($ext === 'css') {
+            return 'css';
+        }
+        // Blade: foo.blade.php or foo.blade
+        $base = strtolower(basename($path));
+        if (str_ends_with($base, '.blade.php') || $ext === 'blade') {
+            return 'blade';
+        }
+        if (in_array($ext, ['php', 'phtml', 'php3', 'php4', 'php5', 'php7', 'php8', 'phps'], true)) {
+            return 'php';
+        }
+        return 'plain';
+    }
+
+    private function wordCount(array $lines): int
+    {
+        $text = implode("\n", $lines);
+        if ($text === '') {
+            return 0;
+        }
+        if (preg_match_all('/[\p{L}\p{N}_]+/u', $text, $m)) {
+            return count($m[0]);
+        }
+        return 0;
+    }
+
+    private function tab(): AzTab
+    {
+        return $this->tabs[$this->tabIndex];
+    }
+
+    private function absolutePath(string $path, ?string $base = null): string
+    {
+        if ($path === '') {
+            return $base ?? getcwd();
+        }
+        if ($path[0] !== DIRECTORY_SEPARATOR && !preg_match('/^[A-Za-z]:[\\\/]/', $path)) {
+            $path = ($base ?? getcwd()) . DIRECTORY_SEPARATOR . $path;
+        }
+        $real = realpath($path);
+        if ($real !== false) {
+            return $real;
+        }
+        $dir = dirname($path);
+        $realDir = realpath($dir);
+        return ($realDir ?: $dir) . DIRECTORY_SEPARATOR . basename($path);
+    }
+
+    private function relativePath(string $path): string
+    {
+        if (strpos($path, $this->root . DIRECTORY_SEPARATOR) === 0) {
+            return substr($path, strlen($this->root) + 1);
+        }
+        return $path;
+    }
+
+    private function escapeControl(string $text): string
+    {
+        return preg_replace_callback('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', function ($m) {
+            return '?';
+        }, $text) ?? $text;
+    }
+
+    private function fitPlain(string $text, int $width): string
+    {
+        $text = $this->truncatePlain($text, $width);
+        return $text . str_repeat(' ', max(0, $width - $this->visualWidth($text)));
+    }
+
+    private function fitAnsi(string $text, int $width): string
+    {
+        $plain = preg_replace('/\033\[[0-9;]*m/', '', $text) ?? $text;
+        $len = $this->visualWidth($plain);
+        if ($len >= $width) {
+            return $this->truncateAnsi($text, $width);
+        }
+        return $text . str_repeat(' ', $width - $len);
+    }
+
+    private function truncatePlain(string $text, int $width): string
+    {
+        $out = '';
+        $visible = 0;
+        $len = strlen($text);
+        for ($i = 0; $i < $len;) {
+            $char = $this->utf8CharAt($text, $i);
+            $charLen = max(1, strlen($char));
+            $charWidth = $char === "\t" ? (4 - ($visible % 4)) : $this->charDisplayWidth($char);
+            if ($charWidth > 0 && $visible + $charWidth > $width) {
+                break;
+            }
+            $out .= $char === "\t" ? str_repeat(' ', max(1, $charWidth)) : $char;
+            $visible += $charWidth;
+            $i += $charLen;
+        }
+        return $out;
+    }
+
+    private function truncateAnsi(string $text, int $width): string
+    {
+        $out = '';
+        $visible = 0;
+        $len = strlen($text);
+        for ($i = 0; $i < $len && $visible < $width;) {
+            if ($text[$i] === "\033" && preg_match('/^\033\[[0-9;]*m/', substr($text, $i), $m)) {
+                $out .= $m[0];
+                $i += strlen($m[0]);
+                continue;
+            }
+
+            $char = $this->utf8CharAt($text, $i);
+            $charLen = max(1, strlen($char));
+            $charWidth = $char === "\t" ? (4 - ($visible % 4)) : $this->charDisplayWidth($char);
+            if ($charWidth > 0 && $visible + $charWidth > $width) {
+                break;
+            }
+            $out .= $char === "\t" ? str_repeat(' ', max(1, $charWidth)) : $char;
+            $visible += $charWidth;
+            $i += $charLen;
+        }
+        if ($visible < $width) {
+            $out .= str_repeat(' ', $width - $visible);
+        }
+        return $out . "\033[0m";
+    }
+
+    private function visualWidth(string $text, int $tabSize = 4): int
+    {
+        $col = 0;
+        $len = strlen($text);
+        for ($i = 0; $i < $len;) {
+            $char = $this->utf8CharAt($text, $i);
+            $charLen = max(1, strlen($char));
+            if ($char === "\t") {
+                $col += $tabSize - ($col % $tabSize);
+            } else {
+                $col += $this->charDisplayWidth($char);
+            }
+            $i += $charLen;
+        }
+        return $col;
+    }
+
+    private function utf8SequenceLength(int $ord): int
+    {
+        if ($ord >= 0xC2 && $ord <= 0xDF) {
+            return 2;
+        }
+        if ($ord >= 0xE0 && $ord <= 0xEF) {
+            return 3;
+        }
+        if ($ord >= 0xF0 && $ord <= 0xF4) {
+            return 4;
+        }
+        return 1;
+    }
+
+    private function utf8CharAt(string $text, int $offset): string
+    {
+        $len = strlen($text);
+        if ($offset < 0 || $offset >= $len) {
+            return '';
+        }
+
+        $needed = $this->utf8SequenceLength(ord($text[$offset]));
+        $char = substr($text, $offset, $needed);
+        if ($needed > 1 && strlen($char) === $needed && $this->isValidUtf8($char)) {
+            return $char;
+        }
+        return $text[$offset];
+    }
+
+    private function nextCharOffset(string $text, int $offset): int
+    {
+        $len = strlen($text);
+        $offset = max(0, min($offset, $len));
+        if ($offset >= $len) {
+            return $len;
+        }
+        return min($len, $offset + max(1, strlen($this->utf8CharAt($text, $offset))));
+    }
+
+    private function prevCharOffset(string $text, int $offset): int
+    {
+        $offset = max(0, min($offset, strlen($text)));
+        if ($offset === 0) {
+            return 0;
+        }
+        $i = $offset - 1;
+        while ($i > 0 && $this->isUtf8ContinuationByte(ord($text[$i]))) {
+            $i--;
+        }
+        return $i;
+    }
+
+    private function clampByteCol(string $line, int $col): int
+    {
+        $len = strlen($line);
+        $col = max(0, min($col, $len));
+        while ($col > 0 && $col < $len && $this->isUtf8ContinuationByte(ord($line[$col]))) {
+            $col--;
+        }
+        return $col;
+    }
+
+    private function removeLastUtf8Char(string $text): string
+    {
+        return substr($text, 0, $this->prevCharOffset($text, strlen($text)));
+    }
+
+    private function isUtf8ContinuationByte(int $ord): bool
+    {
+        return $ord >= 0x80 && $ord <= 0xBF;
+    }
+
+    private function isValidUtf8(string $text): bool
+    {
+        return preg_match('//u', $text) === 1;
+    }
+
+    private function containsControlChars(string $text): bool
+    {
+        return preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $text) === 1;
+    }
+
+    private function charDisplayWidth(string $char): int
+    {
+        if ($char === '') {
+            return 0;
+        }
+        if (!$this->isValidUtf8($char)) {
+            return 1;
+        }
+        if (preg_match('/^\p{Mn}$/u', $char) === 1) {
+            return 0;
+        }
+
+        $cp = $this->utf8Codepoint($char);
+        if ($cp === null) {
+            return 1;
+        }
+        if ($cp === 0 || ($cp < 32) || ($cp >= 0x7F && $cp < 0xA0)) {
+            return 0;
+        }
+
+        return $this->isWideCodepoint($cp) ? 2 : 1;
+    }
+
+    private function utf8Codepoint(string $char): ?int
+    {
+        if ($char === '') {
+            return null;
+        }
+        $b1 = ord($char[0]);
+        $len = strlen($char);
+        if ($b1 < 0x80) {
+            return $b1;
+        }
+        if ($len >= 2 && $b1 >= 0xC2 && $b1 <= 0xDF) {
+            return (($b1 & 0x1F) << 6) | (ord($char[1]) & 0x3F);
+        }
+        if ($len >= 3 && $b1 >= 0xE0 && $b1 <= 0xEF) {
+            return (($b1 & 0x0F) << 12) | ((ord($char[1]) & 0x3F) << 6) | (ord($char[2]) & 0x3F);
+        }
+        if ($len >= 4 && $b1 >= 0xF0 && $b1 <= 0xF4) {
+            return (($b1 & 0x07) << 18) | ((ord($char[1]) & 0x3F) << 12) | ((ord($char[2]) & 0x3F) << 6) | (ord($char[3]) & 0x3F);
+        }
+        return null;
+    }
+
+    private function isWideCodepoint(int $cp): bool
+    {
+        return ($cp >= 0x1100 && $cp <= 0x115F)
+            || ($cp >= 0x2329 && $cp <= 0x232A)
+            || ($cp >= 0x2E80 && $cp <= 0xA4CF)
+            || ($cp >= 0xAC00 && $cp <= 0xD7A3)
+            || ($cp >= 0xF900 && $cp <= 0xFAFF)
+            || ($cp >= 0xFE10 && $cp <= 0xFE19)
+            || ($cp >= 0xFE30 && $cp <= 0xFE6F)
+            || ($cp >= 0xFF00 && $cp <= 0xFF60)
+            || ($cp >= 0xFFE0 && $cp <= 0xFFE6)
+            || ($cp >= 0x1F300 && $cp <= 0x1FAFF);
+    }
+}
+
+$app = new Az($argv);
+$app->run();

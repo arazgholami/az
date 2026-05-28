@@ -1,2 +1,2 @@
 # az
-Sane Editor
+Sane Editor for CLI
