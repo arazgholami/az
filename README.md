@@ -54,3 +54,6 @@ It is a simple editor that behaves like a normal text editor, stays keyboard-fri
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/arazgholami/az/refs/heads/main/install.sh | sh
+
+## License
+WTFPL
