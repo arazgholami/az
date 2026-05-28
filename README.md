@@ -1,6 +1,6 @@
 # az
 
-`az` is a small, sane terminal text editor written in PHP.
+`az` is a small, sane terminal text editor written in PHP with NO external dependencies except PHP CLI.
 It opens ready to type, supports project folders, tabs, a project tree, quick opening, command actions, line numbers, simple shortcuts, syntax highlighting, and autocomplete.
 
 ![az screenshot](az-screenshot.jpg)
@@ -10,7 +10,6 @@ It opens ready to type, supports project folders, tabs, a project tree, quick op
 - Keyboard-only editing
 - Opens files or folders
 - Project tree sidebar
-- Sidebar shortcuts shown at the bottom
 - Tabs with Alt+1 to Alt+9
 - Quick open with Ctrl+O
 - Open files and jump to a line with `file.php:20`
@@ -27,8 +26,6 @@ It opens ready to type, supports project folders, tabs, a project tree, quick op
 - UTF-8 input support
 - Syntax highlighting for PHP, Blade, HTML, and CSS
 - Autocomplete for HTML, CSS, and PHP
-- Top bar with editor name, tabs, live time, and date
-- No external dependencies except PHP CLI
 
 ## Install
 
