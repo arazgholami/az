@@ -1,0 +1,14 @@
+[package]
+name = "az"
+version = "2.0.0"
+edition = "2021"
+authors = ["Araz Gholami", "Rust rewrite by ChatGPT"]
+description = "A fast, sane terminal text editor for code and large text files."
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

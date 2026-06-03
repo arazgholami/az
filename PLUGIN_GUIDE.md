@@ -1,0 +1,35 @@
+# Az plugins
+
+Language support now lives in `src/plugins`.
+
+Files included:
+
+- `php.rs`: PHP highlighting, PHP autocomplete, PHP symbols
+- `html.rs`: HTML highlighting, tag autocomplete, attribute autocomplete, HTML symbols
+- `css.rs`: CSS highlighting, property/value/at-rule autocomplete, CSS symbols
+- `javascript.rs`: JavaScript highlighting, autocomplete, symbols
+- `blade.rs`: Blade directives, Blade expressions, Blade symbols
+- `example.rs`: documented skeleton for adding a new plugin
+- `mod.rs`: plugin registry and mixed-language facade used by the editor
+
+## Add a new plugin
+
+1. Create `src/plugins/language.rs`.
+2. Add `pub(crate) mod language;` in `src/plugins/mod.rs`.
+3. Add its command word and extensions in `from_word` and `from_path`. For JavaScript, that is `js | javascript | mjs | cjs | jsx` and `.js/.mjs/.cjs/.jsx`.
+4. Wire it into `highlight_segments`, `completion_context`, `completion_items`, and `extract_symbols` only if needed.
+
+Plugins are compiled Rust modules. They do not need external crates.
+
+
+## JavaScript plugin wiring example
+
+The JavaScript plugin is enabled in these places:
+
+- `src/plugins/javascript.rs`: actual highlighting, completion, and symbols.
+- `src/plugins/mod.rs`: `pub(crate) mod javascript;` registers the file.
+- `src/plugins/mod.rs`: `from_word()` enables `set js` / `set javascript`.
+- `src/plugins/mod.rs`: `from_path()` enables `.js`, `.mjs`, `.cjs`, and `.jsx` files.
+- `src/plugins/mod.rs`: `highlight_segments()`, `completion_context()`, `completion_items()`, and `extract_symbols()` delegate editor features to the plugin.
+- `src/main.rs`: `SyntaxMode::JavaScript` adds JS as an editor mode.
+- `src/main.rs`: `command_items()` and `run_command()` add the command palette item.

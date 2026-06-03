@@ -1,0 +1,2723 @@
+use std::cmp::{max, min};
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::ffi::OsStr;
+use std::fs;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::raw::{c_int, c_ulong, c_ushort};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod plugins;
+
+const BG: &str = "#1a1b26";
+const BG_DARK: &str = "#16161e";
+const BG_FLOAT: &str = "#1f2335";
+const BG_HIGHLIGHT: &str = "#292e42";
+const FG: &str = "#c0caf5";
+const FG_DARK: &str = "#a9b1d6";
+const GUTTER: &str = "#3b4261";
+const COMMENT: &str = "#565f89";
+const BLUE: &str = "#7aa2f7";
+const CYAN: &str = "#7dcfff";
+const GREEN: &str = "#9ece6a";
+const GREEN2: &str = "#73daca";
+const MAGENTA: &str = "#bb9af7";
+const PURPLE: &str = "#9d7cd8";
+const ORANGE: &str = "#ff9e64";
+const YELLOW: &str = "#e0af68";
+const RED: &str = "#f7768e";
+const ACCENT: &str = BLUE;
+const HISTORY_LIMIT: usize = 400;
+const QUICK_OPEN_LIMIT: usize = 2500;
+const PROJECT_SEARCH_LIMIT: usize = 80;
+const HUGE_SCAN_LIMIT: usize = 20_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyntaxMode {
+    Php,
+    Blade,
+    Html,
+    Css,
+    JavaScript,
+    Plain,
+}
+
+impl SyntaxMode {
+    fn label(self) -> &'static str { plugins::mode_label(self) }
+    fn from_word(word: &str) -> Option<Self> { plugins::from_word(word) }
+    fn from_path(path: Option<&Path>) -> Self { plugins::from_path(path) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pos {
+    line: usize,
+    col: usize,
+}
+
+#[derive(Clone)]
+enum TextOp {
+    Insert { pos: Pos, text: String },
+    Delete { pos: Pos, text: String },
+}
+
+#[derive(Clone)]
+struct HistoryEntry {
+    ops: Vec<TextOp>,
+    before: Pos,
+    after: Pos,
+}
+
+struct Tab {
+    path: Option<PathBuf>,
+    name: String,
+    lines: Vec<String>,
+    cursor: Pos,
+    row_offset: usize,
+    col_offset: usize,
+    modified: bool,
+    revision: u64,
+    saved_revision: u64,
+    syntax_mode: Option<SyntaxMode>,
+    undo: Vec<HistoryEntry>,
+    redo: Vec<HistoryEntry>,
+    large_file: bool,
+}
+
+impl Tab {
+    fn empty() -> Self {
+        Self {
+            path: None,
+            name: "Untitled".to_string(),
+            lines: vec![String::new()],
+            cursor: Pos { line: 0, col: 0 },
+            row_offset: 0,
+            col_offset: 0,
+            modified: false,
+            revision: 0,
+            saved_revision: 0,
+            syntax_mode: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            large_file: false,
+        }
+    }
+
+    fn from_path(path: PathBuf) -> io::Result<Self> {
+        let bytes = fs::read(&path)?;
+        let large_file = bytes.len() >= 2 * 1024 * 1024;
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let name = path.file_name().and_then(OsStr::to_str).unwrap_or("Untitled").to_string();
+        Ok(Self {
+            path: Some(path),
+            name,
+            lines,
+            cursor: Pos { line: 0, col: 0 },
+            row_offset: 0,
+            col_offset: 0,
+            modified: false,
+            revision: 0,
+            saved_revision: 0,
+            syntax_mode: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            large_file,
+        })
+    }
+
+    fn syntax(&self) -> SyntaxMode {
+        self.syntax_mode.unwrap_or_else(|| SyntaxMode::from_path(self.path.as_deref()))
+    }
+
+    fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+}
+
+#[derive(Clone)]
+struct TreeRow {
+    path: PathBuf,
+    is_dir: bool,
+    depth: usize,
+    name: String,
+}
+
+#[derive(Clone)]
+struct PickerItem {
+    label: String,
+    detail: String,
+    path: Option<PathBuf>,
+    line: Option<usize>,
+    action: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CompletionItem {
+    pub(crate) label: String,
+    pub(crate) insert: String,
+    pub(crate) detail: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Editor,
+    Tree,
+}
+
+struct Editor {
+    root: PathBuf,
+    tabs: Vec<Tab>,
+    tab_index: usize,
+    running: bool,
+    original_stty: String,
+    message: String,
+    clipboard: String,
+    last_find: String,
+    focus: Focus,
+    expanded: HashSet<PathBuf>,
+    tree_rows: Vec<TreeRow>,
+    tree_index: usize,
+    tree_scroll: usize,
+    needs_tree_refresh: bool,
+    rows: usize,
+    cols: usize,
+    tree_width: usize,
+    base_tree_width: usize,
+    sidebar_hidden: bool,
+    content_height: usize,
+    status_line: usize,
+    selection_anchor: Option<Pos>,
+    show_welcome: bool,
+    hide_initial_untitled: bool,
+    alt_tab_hints_until: Option<Instant>,
+    autocomplete_visible: bool,
+    autocomplete_items: Vec<CompletionItem>,
+    autocomplete_index: usize,
+    autocomplete_line: usize,
+    autocomplete_start_col: usize,
+    autocomplete_prefix: String,
+    last_recovery_write: HashMap<String, Instant>,
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let mut editor = Editor::new(args);
+    if let Err(err) = editor.run() {
+        let _ = editor.cleanup();
+        eprintln!("az: {err}");
+    }
+}
+
+impl Editor {
+    fn new(args: Vec<String>) -> Self {
+        let target = args.get(1).map(PathBuf::from).unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let abs = absolute_path(&target, None);
+        let mut tabs = Vec::new();
+        let root;
+        let mut focus = Focus::Editor;
+        let mut show_welcome = false;
+        let mut hide_initial_untitled = false;
+        let mut message = "Welcome to Az".to_string();
+
+        if abs.is_file() {
+            root = abs.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+            match Tab::from_path(abs.clone()) {
+                Ok(tab) => tabs.push(tab),
+                Err(_) => tabs.push(Tab::empty()),
+            }
+        } else {
+            root = if abs.is_dir() { abs } else { env::current_dir().unwrap_or_else(|_| PathBuf::from(".")) };
+            tabs.push(Tab::empty());
+            focus = Focus::Tree;
+            show_welcome = true;
+            hide_initial_untitled = true;
+            message = "Folder opened. Ctrl+O quick open, Ctrl+P commands, Ctrl+T switches tree/editor".to_string();
+        }
+
+        let mut expanded = HashSet::new();
+        expanded.insert(root.clone());
+
+        Self {
+            root,
+            tabs,
+            tab_index: 0,
+            running: true,
+            original_stty: String::new(),
+            message,
+            clipboard: String::new(),
+            last_find: String::new(),
+            focus,
+            expanded,
+            tree_rows: Vec::new(),
+            tree_index: 0,
+            tree_scroll: 0,
+            needs_tree_refresh: true,
+            rows: 24,
+            cols: 80,
+            tree_width: 28,
+            base_tree_width: 28,
+            sidebar_hidden: false,
+            content_height: 20,
+            status_line: 23,
+            selection_anchor: None,
+            show_welcome,
+            hide_initial_untitled,
+            alt_tab_hints_until: None,
+            autocomplete_visible: false,
+            autocomplete_items: Vec::new(),
+            autocomplete_index: 0,
+            autocomplete_line: 0,
+            autocomplete_start_col: 0,
+            autocomplete_prefix: String::new(),
+            last_recovery_write: HashMap::new(),
+        }
+    }
+
+    fn run(&mut self) -> io::Result<()> {
+        self.try_restore_session();
+        self.enable_raw_mode()?;
+        print!("\x1b[2J\x1b[H");
+        io::stdout().flush()?;
+        self.offer_recovery();
+
+        if self.show_welcome {
+            self.render()?;
+            self.render_welcome_screen()?;
+            let _ = self.read_key_blocking()?;
+            self.show_welcome = false;
+        }
+
+        let mut needs_render = true;
+        let mut last_minute = current_minute();
+        while self.running {
+            let minute = current_minute();
+            if needs_render || minute != last_minute {
+                self.render()?;
+                needs_render = false;
+                last_minute = minute;
+            }
+            if let Some(key) = self.read_key()? {
+                self.handle_key(key);
+                needs_render = true;
+            }
+        }
+        self.cleanup()
+    }
+
+    fn enable_raw_mode(&mut self) -> io::Result<()> {
+        if let Ok(out) = stty_output(["-g"]) {
+            self.original_stty = String::from_utf8_lossy(&out).trim().to_string();
+        }
+        let _ = stty_status(["-echo", "-icanon", "-isig", "-ixon", "-ixoff", "min", "0", "time", "1"]);
+        print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
+        io::stdout().flush()
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        self.save_session();
+        print!("\x1b[?2004l\x1b[0m\x1b[?25h\x1b[?1049l\r\n");
+        io::stdout().flush()?;
+        if !self.original_stty.is_empty() {
+            if stty_status([self.original_stty.as_str()]).is_err() {
+                let _ = stty_status(["sane"]);
+            }
+        } else {
+            let _ = stty_status(["sane"]);
+        }
+        Ok(())
+    }
+
+    fn read_terminal_size(&mut self) {
+        if let Some((r, c)) = terminal_size_from_ioctl() {
+            self.apply_terminal_size(r, c);
+            return;
+        }
+        if let Ok(out) = stty_output(["size"]) {
+            let s = String::from_utf8_lossy(&out);
+            let parts: Vec<&str> = s.split_whitespace().collect();
+            if parts.len() == 2 {
+                if let (Ok(r), Ok(c)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+                    self.apply_terminal_size(r, c);
+                    return;
+                }
+            }
+        }
+        let rows = env::var("LINES").ok().and_then(|v| v.parse().ok()).unwrap_or(24);
+        let cols = env::var("COLUMNS").ok().and_then(|v| v.parse().ok()).unwrap_or(80);
+        self.apply_terminal_size(rows, cols);
+    }
+
+    fn apply_terminal_size(&mut self, rows: usize, cols: usize) {
+        self.rows = max(10, rows);
+        self.cols = max(30, cols);
+        self.status_line = self.rows;
+        self.content_height = self.rows.saturating_sub(2);
+    }
+
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.tab_index]
+    }
+
+    fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.tab_index]
+    }
+
+    fn read_key_blocking(&mut self) -> io::Result<String> {
+        loop {
+            if let Some(k) = self.read_key()? {
+                return Ok(k);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn read_key(&mut self) -> io::Result<Option<String>> {
+        let mut first = [0u8; 1];
+        let n = io::stdin().read(&mut first)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut bytes = vec![first[0]];
+        if first[0] == 0x1b {
+            let start = Instant::now();
+            loop {
+                let mut buf = [0u8; 64];
+                match io::stdin().read(&mut buf) {
+                    Ok(0) => {
+                        if start.elapsed() > Duration::from_millis(25) { break; }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(n) => {
+                        bytes.extend_from_slice(&buf[..n]);
+                        if bytes.ends_with(b"~") || bytes.ends_with(b"u") || bytes.ends_with(b"A") || bytes.ends_with(b"B") || bytes.ends_with(b"C") || bytes.ends_with(b"D") || bytes.ends_with(b"H") || bytes.ends_with(b"F") {
+                            break;
+                        }
+                        if start.elapsed() > Duration::from_millis(60) { break; }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if bytes == b"\x1b[200~" {
+                let paste = self.read_bracketed_paste()?;
+                return Ok(Some(format!("\0AZPASTE:{paste}")));
+            }
+            return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        if first[0] >= 0xC0 {
+            let want = utf8_sequence_len(first[0]);
+            while bytes.len() < want {
+                let mut b = [0u8; 1];
+                let n = io::stdin().read(&mut b)?;
+                if n == 0 { break; }
+                bytes.push(b[0]);
+            }
+        }
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    fn read_bracketed_paste(&mut self) -> io::Result<String> {
+        let mut bytes = Vec::new();
+        let end = b"\x1b[201~";
+        loop {
+            let mut buf = [0u8; 4096];
+            let n = io::stdin().read(&mut buf)?;
+            if n == 0 {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+            if let Some(pos) = find_bytes(&bytes, end) {
+                bytes.truncate(pos);
+                break;
+            }
+            if bytes.len() > 5 * 1024 * 1024 {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn handle_key(&mut self, key: String) {
+        if let Some(pasted) = key.strip_prefix("\0AZPASTE:") {
+            self.close_autocomplete();
+            if self.focus == Focus::Editor {
+                self.insert_text(pasted);
+                self.message = "Pasted".to_string();
+            }
+            return;
+        }
+
+        if self.focus == Focus::Editor && self.handle_autocomplete_key(&key) {
+            return;
+        }
+        if self.focus != Focus::Editor {
+            self.close_autocomplete();
+        }
+        if self.handle_global_shortcut(&key) {
+            return;
+        }
+        match self.focus {
+            Focus::Tree => self.handle_tree_key(&key),
+            Focus::Editor => self.handle_editor_key(&key),
+        }
+    }
+
+    fn handle_global_shortcut(&mut self, key: &str) -> bool {
+        if key == "\x1b" {
+            self.alt_tab_hints_until = Some(Instant::now() + Duration::from_millis(1200));
+            self.message = "Alt+1-9 switches tabs".to_string();
+            return true;
+        }
+        match key {
+            "\x11" => { self.confirm_quit(); true }
+            "\x13" => { self.save_current_tab(); true }
+            "\x1a" => { self.undo(); true }
+            "\x19" => { self.redo(); true }
+            "\x0f" => { self.quick_open(); true }
+            "\x10" => { self.command_palette(); true }
+            "\x07" => { self.go_to_line_prompt(); true }
+            "\x14" => { self.toggle_tree_focus(); true }
+            "\x08" => { self.toggle_sidebar(); true }
+            "\x06" => { self.find_prompt(); true }
+            "\x12" => { self.replace_prompt(); true }
+            "\x0e" => { self.new_tab(true); self.message = "New file".to_string(); true }
+            "\x04" => { self.close_current_tab(); true }
+            "\x03" => { self.copy_selection_or_line(); true }
+            "\x18" => { self.cut_selection_or_line(); true }
+            "\x16" => { self.paste_clipboard(); true }
+            "\x01" => { self.select_all(); true }
+            "\x17" => { self.delete_current_line(); true }
+            _ => {
+                if is_ctrl_slash(key) { self.show_shortcuts_help(); return true; }
+                if is_ctrl_shift_f(key) { self.project_search_prompt(); return true; }
+                if is_ctrl_shift_z(key) { self.redo(); return true; }
+                if is_ctrl_backspace(key) { self.delete_current_line(); return true; }
+                if let Some(n) = tab_number(key) { self.switch_to_tab_number(n); return true; }
+                false
+            }
+        }
+    }
+
+    fn handle_tree_key(&mut self, key: &str) {
+        self.refresh_tree();
+        match key {
+            "n" => self.new_tree_file_prompt(),
+            "N" => self.new_tree_folder_prompt(),
+            "r" | "R" => self.rename_tree_path_prompt(false),
+            "\x1b[3~" => self.delete_tree_path_prompt(false),
+            "\x1b[A" => self.tree_index = self.tree_index.saturating_sub(1),
+            "\x1b[B" => self.tree_index = min(self.tree_rows.len().saturating_sub(1), self.tree_index + 1),
+            "\x1b[5~" => self.tree_index = self.tree_index.saturating_sub(max(1, self.content_height)),
+            "\x1b[6~" => self.tree_index = min(self.tree_rows.len().saturating_sub(1), self.tree_index + max(1, self.content_height)),
+            "\r" | "\n" => {
+                if let Some(row) = self.tree_rows.get(self.tree_index).cloned() {
+                    if row.is_dir {
+                        if self.expanded.contains(&row.path) { self.expanded.remove(&row.path); } else { self.expanded.insert(row.path); }
+                        self.needs_tree_refresh = true;
+                    } else {
+                        self.open_file(row.path, true);
+                        self.focus = Focus::Editor;
+                    }
+                }
+            }
+            "\x1b[D" => {
+                if let Some(row) = self.tree_rows.get(self.tree_index) {
+                    if row.is_dir {
+                        self.expanded.remove(&row.path);
+                        self.needs_tree_refresh = true;
+                    }
+                }
+            }
+            "\x1b[C" => {
+                if let Some(row) = self.tree_rows.get(self.tree_index) {
+                    if row.is_dir {
+                        self.expanded.insert(row.path.clone());
+                        self.needs_tree_refresh = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_editor_key(&mut self, key: &str) {
+        if is_ctrl_left(key) { self.move_word_left(false); return; }
+        if is_ctrl_right(key) { self.move_word_right(false); return; }
+        if is_ctrl_shift_left(key) { self.move_word_left(true); return; }
+        if is_ctrl_shift_right(key) { self.move_word_right(true); return; }
+
+        match key {
+            "\x1b[A" => { self.close_autocomplete(); self.move_cursor(-1, 0, false); }
+            "\x1b[B" => { self.close_autocomplete(); self.move_cursor(1, 0, false); }
+            "\x1b[C" => { self.close_autocomplete(); self.move_right(false); }
+            "\x1b[D" => { self.close_autocomplete(); self.move_left(false); }
+            "\x1b[1;2A" => self.move_cursor(-1, 0, true),
+            "\x1b[1;2B" => self.move_cursor(1, 0, true),
+            "\x1b[1;2C" => self.move_right(true),
+            "\x1b[1;2D" => self.move_left(true),
+            "\x1b[H" | "\x1bOH" | "\x1b[1~" => self.home(false),
+            "\x1b[F" | "\x1bOF" | "\x1b[4~" => self.end(false),
+            "\x1b[1;2H" => self.home(true),
+            "\x1b[1;2F" => self.end(true),
+            "\x1b[5~" => self.page(-1, false),
+            "\x1b[6~" => self.page(1, false),
+            "\x1b[3~" => { self.delete_forward(); self.refresh_autocomplete(false); }
+            "\x7f" | "\x08" => { self.backspace(); self.refresh_autocomplete(false); }
+            "\r" | "\n" => { self.close_autocomplete(); self.insert_newline(); }
+            "\x1b" => { self.close_autocomplete(); self.clear_selection(); self.message = "Selection cleared".to_string(); }
+            _ => {
+                if is_printable(key) {
+                    if (key == "(" || key == "{") && self.insert_auto_closed_pair(key) {
+                        self.refresh_autocomplete(false);
+                        return;
+                    }
+                    self.insert_text(key);
+                    if key == ">" { self.auto_close_html_tag(); }
+                    if key != "\t" { self.refresh_autocomplete(false); }
+                }
+            }
+        }
+    }
+
+    fn render(&mut self) -> io::Result<()> {
+        self.read_terminal_size();
+        self.refresh_tree();
+        self.update_tree_width();
+        self.ensure_editor_visible();
+        self.ensure_tree_visible();
+
+        let mut out = String::new();
+        out.push_str("\x1b[?25l\x1b[H");
+        out.push_str(&ansi_fg(FG));
+        out.push_str(&ansi_bg(BG));
+        out.push_str(&self.render_topbar());
+        out.push_str(&self.render_content());
+        out.push_str(&self.render_status_line());
+
+        let (cursor_row, cursor_col) = self.cursor_screen_position();
+        out.push_str(&self.render_autocomplete_dropdown(cursor_row, cursor_col));
+        out.push_str(&format!("\x1b[{};{}H\x1b[?25h", cursor_row, cursor_col));
+        print!("{out}");
+        io::stdout().flush()
+    }
+
+    fn render_topbar(&self) -> String {
+        let style = ansi_style(Some(ACCENT), Some(BG_FLOAT), true, false, false);
+        let right = format!(" {} ", time_date_text());
+        let title = " az | sane editor ";
+        let prefix = if self.sidebar_hidden {
+            format!("{title} ")
+        } else {
+            format!("{} ", fit_plain(title, self.tree_width))
+        };
+        let right_w = visual_width(&right);
+        let prefix_w = visual_width(&prefix);
+        let avail_tabs = self.cols.saturating_sub(prefix_w + right_w);
+        let tabs = fit_ansi(&self.render_tabs_text(&style), avail_tabs);
+        let left = fit_ansi(&(prefix + &tabs), self.cols.saturating_sub(right_w));
+        format!("{style}{left}{style}{right}\x1b[0m\r\n")
+    }
+
+    fn render_tabs_text(&self, base_style: &str) -> String {
+        let mut out = String::new();
+        let show_alt = self.alt_tab_hints_until.map(|t| Instant::now() < t).unwrap_or(false);
+        let visible = self.visible_tab_indexes();
+        for (visible_index, tab_index) in visible.iter().enumerate() {
+            let tab = &self.tabs[*tab_index];
+            let mut number = (visible_index + 1).to_string();
+            if show_alt { number = format!("\x1b[4m{number}\x1b[24m"); }
+            let modified = if tab.modified { "*" } else { "" };
+            let name = escape_control(&tab.name);
+            if *tab_index == self.tab_index {
+                out.push_str(&ansi_style(Some(BG_DARK), Some(ACCENT), true, false, false));
+                out.push_str(&format!(" {number}:{name}{modified} \x1b[0m{base_style}"));
+            } else {
+                out.push_str(&ansi_style(Some(FG_DARK), Some(BG_FLOAT), false, false, false));
+                out.push_str(&format!(" {number}:{name}{modified} {base_style}"));
+            }
+        }
+        out
+    }
+
+    fn visible_tab_indexes(&self) -> Vec<usize> {
+        self.tabs.iter().enumerate()
+            .filter(|(i, t)| !self.is_hidden_initial_tab(*i, t))
+            .map(|(i, _)| i)
+            .take(9)
+            .collect()
+    }
+
+    fn is_hidden_initial_tab(&self, index: usize, tab: &Tab) -> bool {
+        self.hide_initial_untitled && index == 0 && tab.path.is_none() && !tab.modified
+    }
+
+    fn render_content(&self) -> String {
+        let mut out = String::new();
+        let tab = self.tab();
+        let gutter = self.line_number_gutter_width();
+        let editor_start = self.editor_start_col();
+        let text_width = self.editor_text_width();
+        let syntax = tab.syntax();
+
+        let visible = self.visible_line_range();
+        for screen_line in 0..self.content_height {
+            let row_no = screen_line + 2;
+            out.push_str(&format!("\x1b[{row_no};1H"));
+            if !self.sidebar_hidden {
+                out.push_str(&self.render_tree_line(screen_line));
+            }
+            let line_no = visible.0 + screen_line;
+            if line_no < tab.lines.len() {
+                let gutter_text = format!("{:>width$} ", line_no + 1, width = gutter.saturating_sub(1));
+                out.push_str(&format!("\x1b[{row_no};{editor_start}H{}{}\x1b[0m", ansi_style(Some(GUTTER), Some(BG), false, true, false), fit_plain(&gutter_text, gutter)));
+                let line = &tab.lines[line_no];
+                let rendered = self.render_editor_line(line, line_no, syntax, text_width);
+                out.push_str(&rendered);
+            } else {
+                out.push_str(&format!("\x1b[{row_no};{editor_start}H{}~{}", ansi_style(Some(GUTTER), Some(BG), false, true, false), reset_fg_bg()));
+                out.push_str(&fit_plain("", self.cols.saturating_sub(editor_start).saturating_add(1)));
+            }
+        }
+        out
+    }
+
+    fn visible_line_range(&self) -> (usize, usize) {
+        let tab = self.tab();
+        let start = min(tab.row_offset, tab.lines.len().saturating_sub(1));
+        let end = min(tab.lines.len(), start + self.content_height);
+        (start, end)
+    }
+
+    fn line_number_gutter_width(&self) -> usize {
+        let digits = self.tab().lines.len().max(1).to_string().len();
+        max(4, digits + 2)
+    }
+
+    fn editor_start_col(&self) -> usize {
+        if self.sidebar_hidden { 1 } else { self.tree_width + 1 }
+    }
+
+    fn editor_text_width(&self) -> usize {
+        let start = self.editor_start_col();
+        self.cols.saturating_sub(start + self.line_number_gutter_width()).saturating_add(1).max(1)
+    }
+
+    fn render_tree_line(&self, screen_line: usize) -> String {
+        let width = self.tree_width.max(1);
+        let row_idx = self.tree_scroll + screen_line;
+        let mut text = String::new();
+        if let Some(row) = self.tree_rows.get(row_idx) {
+            let prefix = if row.is_dir {
+                if self.expanded.contains(&row.path) { "▾ " } else { "▸ " }
+            } else { "  " };
+            let indent = "  ".repeat(row.depth);
+            text = format!("{indent}{prefix}{}", row.name);
+        } else if self.content_height >= 4 && screen_line + 3 >= self.content_height {
+            let lines = self.sidebar_shortcut_lines();
+            let idx = screen_line + 3 - self.content_height;
+            if idx < lines.len() { text = lines[idx].clone(); }
+        }
+        let selected = row_idx == self.tree_index && self.focus == Focus::Tree;
+        let style = if selected {
+            ansi_style(Some(BG_DARK), Some(ACCENT), true, false, false)
+        } else if row_idx < self.tree_rows.len() {
+            let row = &self.tree_rows[row_idx];
+            ansi_style(Some(plugins::tree_color(&row.path, row.is_dir)), Some(BG_DARK), row.is_dir, false, false)
+        } else {
+            ansi_style(Some(FG_DARK), Some(BG_DARK), false, false, false)
+        };
+        format!("{style}{}\x1b[0m", fit_plain(&text, width))
+    }
+
+    fn sidebar_shortcut_lines(&self) -> Vec<String> {
+        if self.tree_width < 18 {
+            vec!["Enter open".to_string(), "N file  R rename".to_string(), "Del delete".to_string()]
+        } else {
+            vec!["Enter open/fold".to_string(), "N file  Shift+N folder".to_string(), "R rename  Del delete".to_string()]
+        }
+    }
+
+    fn render_editor_line(&self, line: &str, line_no: usize, syntax: SyntaxMode, width: usize) -> String {
+        let tab = self.tab();
+        let start = clamp_char_boundary(line, min(tab.col_offset, line.len()));
+        let mut out = String::new();
+        let segs = highlight_segments(line, syntax);
+        let sel = self.selection_range();
+        let mut byte_i = start;
+        let mut used = 0usize;
+
+        while byte_i < line.len() {
+            let ch = next_char(line, byte_i);
+            let next_i = byte_i + ch.len();
+            let rendered = display_cell(ch);
+            let cell_w = visual_width(&rendered);
+            if used + cell_w > width { break; }
+
+            let selected = sel.map(|(a, b)| range_overlaps_selection(line_no, byte_i, next_i, a, b)).unwrap_or(false);
+            let fg = color_at(&segs, byte_i).unwrap_or(FG);
+            if selected {
+                out.push_str(&ansi_style(Some(BG_DARK), Some(ACCENT), false, false, false));
+            } else {
+                out.push_str(&ansi_style(Some(fg), Some(BG), false, false, false));
+            }
+            out.push_str(&rendered);
+            used += cell_w;
+            byte_i = next_i;
+        }
+
+        if used < width {
+            out.push_str(&ansi_style(Some(FG), Some(BG), false, false, false));
+            out.push_str(&" ".repeat(width - used));
+        }
+        out.push_str("\x1b[0m");
+        out
+    }
+
+    fn render_status_line(&self) -> String {
+        let tab = self.tab();
+        let path = tab.path.as_ref().map(|p| relative_path(&self.root, p)).unwrap_or_else(|| tab.name.clone());
+        let state = if tab.modified { "modified" } else { "saved" };
+        let syntax_label = if tab.syntax_mode.is_some() { format!("{} manual", tab.syntax().label()) } else { tab.syntax().label().to_string() };
+        let focus = if self.focus == Focus::Tree { "tree" } else { "editor" };
+        let tree = if self.sidebar_hidden { "tree hidden" } else { "tree shown" };
+        let large = if tab.large_file { "  LARGE" } else { "" };
+        let stats = format!("Ln {}, Col {}  Lines {}  Words {}{}", tab.cursor.line + 1, tab.cursor.col + 1, tab.lines.len(), word_count(&tab.lines), large);
+        let left = format!(" {focus}  {path}  {state}  {syntax_label}  {tree} ");
+        let right = format!(" {}  {} ", self.message, stats);
+        let left_w = visual_width(&left);
+        let right_w = visual_width(&right);
+        let mut line = if left_w + right_w + 1 < self.cols {
+            format!("{}{}{}", left, " ".repeat(self.cols - left_w - right_w), right)
+        } else {
+            fit_plain(&format!("{left} {right}"), self.cols)
+        };
+        line = fit_plain(&line, self.cols);
+        format!("\x1b[{};1H{}{}\x1b[0m", self.status_line, ansi_style(Some(FG), Some(BG_HIGHLIGHT), false, false, false), line)
+    }
+
+    fn cursor_screen_position(&self) -> (usize, usize) {
+        if self.focus == Focus::Tree && !self.sidebar_hidden {
+            let visible = self.tree_index.saturating_sub(self.tree_scroll);
+            return (2 + min(visible, self.content_height.saturating_sub(1)), 1);
+        }
+        let tab = self.tab();
+        let row = 2 + tab.cursor.line.saturating_sub(tab.row_offset);
+        let visual = visual_width(&tab.lines[tab.cursor.line][tab.col_offset.min(tab.cursor.col)..tab.cursor.col]);
+        let col = self.editor_start_col() + self.line_number_gutter_width() + min(visual, self.editor_text_width().saturating_sub(1));
+        (max(1, min(self.rows, row)), max(1, min(self.cols, col)))
+    }
+
+    fn render_welcome_screen(&mut self) -> io::Result<()> {
+        let mut lines = vec![
+            "   __ _ ____".to_string(),
+            "  / _` |_  /".to_string(),
+            " | (_| |/ / ".to_string(),
+            r"  \__,_/___|".to_string(),
+            String::new(),
+            "  A small, sane terminal editor for code and text.".to_string(),
+            String::new(),
+            "  START".to_string(),
+            "    az file.php       open a file".to_string(),
+            "    az project/       open a folder".to_string(),
+            String::new(),
+            "  ESSENTIALS".to_string(),
+        ];
+        lines.extend(self.shortcut_help_lines());
+        lines.push(String::new());
+        lines.push("  Press any key to continue ...".to_string());
+        self.render_popup_box(&lines, &[0, 1, 2, 3])
+    }
+
+    fn show_shortcuts_help(&mut self) {
+        let mut lines = vec![
+            "   __ _ ____".to_string(),
+            "  / _` |_  /".to_string(),
+            " | (_| |/ / ".to_string(),
+            r"  \__,_/___|".to_string(),
+            String::new(),
+            "  Keyboard shortcuts".to_string(),
+            String::new(),
+        ];
+        lines.extend(self.shortcut_help_lines());
+        lines.push(String::new());
+        lines.push("  Press any key to return ...".to_string());
+        let _ = self.render();
+        let _ = self.render_popup_box(&lines, &[0, 1, 2, 3]);
+        let _ = self.read_key_blocking();
+        self.message = "Welcome screen closed".to_string();
+    }
+
+    fn shortcut_help_lines(&self) -> Vec<String> {
+        vec![
+            "    Ctrl+S  Save                   Ctrl+O  Quick open file/symbol".to_string(),
+            "    Ctrl+Z  Undo                   Ctrl+Y  Redo".to_string(),
+            "    Ctrl+P  Command palette        Ctrl+G  Go to line".to_string(),
+            "    Ctrl+W  Remove line            Ctrl+T  Show/focus tree".to_string(),
+            "    Ctrl+F  Find                   Ctrl+H  Hide/show tree".to_string(),
+            "    Ctrl+R  Replace                Alt+1-9 Switch tab".to_string(),
+            "    Tab     Complete               Ctrl+D  Close tab".to_string(),
+            "    %term   Case-sensitive find    Ctrl+/  Help".to_string(),
+            "    Ctrl+C  Copy                   Ctrl+Q  Quit".to_string(),
+            "    Ctrl+X  Cut                    Ctrl+A  Select all".to_string(),
+            "    Ctrl+V  Paste                  Ctrl+O  file:line or :line".to_string(),
+            "    Ctrl+P  set php/html/css/js/blade/plain".to_string(),
+        ]
+    }
+
+    fn render_popup_box(&self, lines: &[String], logo_lines: &[usize]) -> io::Result<()> {
+        let width = min(self.cols.saturating_sub(4), max(56, lines.iter().map(|l| visual_width(l)).max().unwrap_or(30) + 4));
+        let height = min(self.rows.saturating_sub(2), lines.len() + 2);
+        let start_col = max(1, (self.cols.saturating_sub(width)) / 2 + 1);
+        let start_row = max(1, (self.rows.saturating_sub(height)) / 2 + 1);
+        let inner = width.saturating_sub(2);
+        let border = ansi_style(Some(BLUE), Some(BG_FLOAT), true, false, false);
+        let mut out = String::new();
+        out.push_str("\x1b[?25l");
+        out.push_str(&format!("\x1b[{start_row};{start_col}H{border}╔{}╗\x1b[0m", "═".repeat(inner)));
+        for i in 0..height.saturating_sub(2) {
+            let row = start_row + 1 + i;
+            let raw = lines.get(i).map(String::as_str).unwrap_or("");
+            let is_logo = logo_lines.contains(&i);
+            let style = if is_logo {
+                ansi_style(Some(ORANGE), Some(BG_FLOAT), true, false, false)
+            } else {
+                ansi_style(Some(FG), Some(BG_FLOAT), false, false, false)
+            };
+            out.push_str(&format!("\x1b[{row};{start_col}H{border}║\x1b[0m{style}{}\x1b[0m{border}║\x1b[0m", fit_plain(raw, inner),));
+        }
+        out.push_str(&format!("\x1b[{};{start_col}H{border}╚{}╝\x1b[0m", start_row + height - 1, "═".repeat(inner)));
+        print!("{out}");
+        io::stdout().flush()
+    }
+
+    fn refresh_tree(&mut self) {
+        if !self.needs_tree_refresh && !self.tree_rows.is_empty() { return; }
+        self.tree_rows.clear();
+        self.add_tree_rows(self.root.clone(), 0);
+        if self.tree_rows.is_empty() {
+            let name = self.root.file_name().and_then(OsStr::to_str).unwrap_or("/").to_string();
+            self.tree_rows.push(TreeRow { path: self.root.clone(), is_dir: true, depth: 0, name });
+        }
+        self.tree_index = min(self.tree_index, self.tree_rows.len().saturating_sub(1));
+        self.needs_tree_refresh = false;
+    }
+
+    fn add_tree_rows(&mut self, dir: PathBuf, depth: usize) {
+        let name = if depth == 0 {
+            dir.file_name().and_then(OsStr::to_str).unwrap_or_else(|| dir.to_str().unwrap_or("/")).to_string()
+        } else {
+            dir.file_name().and_then(OsStr::to_str).unwrap_or("?").to_string()
+        };
+        self.tree_rows.push(TreeRow { path: dir.clone(), is_dir: true, depth, name });
+        if !self.expanded.contains(&dir) { return; }
+        let Ok(read) = fs::read_dir(&dir) else { return; };
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        for entry in read.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "." || name == ".." || matches!(name.as_str(), ".git" | "node_modules" | "vendor" | ".idea" | ".vscode") { continue; }
+            if path.is_dir() { dirs.push(path); } else if path.is_file() { files.push(path); }
+        }
+        dirs.sort_by_key(|p| p.file_name().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default());
+        files.sort_by_key(|p| p.file_name().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default());
+        for p in dirs { self.add_tree_rows(p, depth + 1); }
+        for p in files {
+            let name = p.file_name().and_then(OsStr::to_str).unwrap_or("?").to_string();
+            self.tree_rows.push(TreeRow { path: p, is_dir: false, depth: depth + 1, name });
+        }
+    }
+
+    fn update_tree_width(&mut self) {
+        if self.sidebar_hidden {
+            self.tree_width = 0;
+            return;
+        }
+        let mut width = self.base_tree_width;
+        let visible_end = min(self.tree_rows.len(), self.tree_scroll + self.content_height);
+        for row in &self.tree_rows[self.tree_scroll..visible_end] {
+            width = max(width, min(44, row.depth * 2 + row.name.len() + 4));
+        }
+        self.tree_width = min(width, self.cols / 2).max(18);
+    }
+
+    fn ensure_tree_visible(&mut self) {
+        if self.tree_index < self.tree_scroll {
+            self.tree_scroll = self.tree_index;
+        } else if self.tree_index >= self.tree_scroll + self.content_height {
+            self.tree_scroll = self.tree_index.saturating_sub(self.content_height.saturating_sub(1));
+        }
+    }
+
+    fn ensure_editor_visible(&mut self) {
+        let height = max(1, self.content_height);
+        let width = max(1, self.editor_text_width());
+        let tab = self.tab_mut();
+        tab.cursor.line = min(tab.cursor.line, tab.lines.len().saturating_sub(1));
+        tab.cursor.col = clamp_char_boundary(&tab.lines[tab.cursor.line], min(tab.cursor.col, tab.lines[tab.cursor.line].len()));
+        if tab.cursor.line < tab.row_offset {
+            tab.row_offset = tab.cursor.line;
+        } else if tab.cursor.line >= tab.row_offset + height {
+            tab.row_offset = tab.cursor.line.saturating_sub(height - 1);
+        }
+        if tab.cursor.col < tab.col_offset {
+            tab.col_offset = clamp_char_boundary(&tab.lines[tab.cursor.line], tab.cursor.col);
+        } else {
+            let visual = visual_width(&tab.lines[tab.cursor.line][tab.col_offset.min(tab.cursor.col)..tab.cursor.col]);
+            if visual >= width {
+                tab.col_offset = clamp_char_boundary(&tab.lines[tab.cursor.line], tab.cursor.col.saturating_sub(width / 2));
+            }
+        }
+    }
+
+    fn open_file(&mut self, path: PathBuf, announce: bool) {
+        let path = absolute_path(&path, Some(&self.root));
+        if let Some(idx) = self.tabs.iter().position(|t| t.path.as_ref() == Some(&path)) {
+            self.tab_index = idx;
+            self.focus = Focus::Editor;
+            self.clear_selection();
+            if announce { self.message = format!("Opened {}", relative_path(&self.root, &path)); }
+            return;
+        }
+        match Tab::from_path(path.clone()) {
+            Ok(tab) => {
+                if self.is_hidden_initial_tab(0, &self.tabs[0]) {
+                    self.tabs[0] = tab;
+                    self.tab_index = 0;
+                    self.hide_initial_untitled = false;
+                } else {
+                    self.tabs.push(tab);
+                    self.tab_index = self.tabs.len() - 1;
+                }
+                self.focus = Focus::Editor;
+                self.clear_selection();
+                self.reveal_path_in_tree(&path);
+                if announce { self.message = format!("Opened {}", relative_path(&self.root, &path)); }
+            }
+            Err(_) => self.message = "Could not open file".to_string(),
+        }
+    }
+
+    fn new_tab(&mut self, visible: bool) {
+        self.tabs.push(Tab::empty());
+        self.tab_index = self.tabs.len() - 1;
+        self.hide_initial_untitled = !visible && self.tabs.len() == 1;
+        self.focus = Focus::Editor;
+        self.clear_selection();
+    }
+
+    fn close_current_tab(&mut self) {
+        if self.tab().modified {
+            let ans = self.prompt("Unsaved changes. Close? y/N: ", "");
+            if ans.to_ascii_lowercase() != "y" {
+                self.message = "Close cancelled".to_string();
+                return;
+            }
+        }
+        let tab = self.tabs.remove(self.tab_index);
+        self.delete_recovery_for_tab(&tab);
+        if self.tabs.is_empty() { self.tabs.push(Tab::empty()); }
+        self.tab_index = min(self.tab_index, self.tabs.len().saturating_sub(1));
+        self.clear_selection();
+        self.message = "Tab closed".to_string();
+    }
+
+    fn save_current_tab(&mut self) {
+        if self.tab().path.is_none() {
+            self.save_current_tab_as();
+            return;
+        }
+        let path = self.tab().path.clone().unwrap();
+        let text = self.tab().text();
+        if atomic_write_file(&path, text.as_bytes()).is_ok() {
+            let rev = self.tab().revision;
+            let tab = self.tab_mut();
+            tab.saved_revision = rev;
+            tab.modified = false;
+            self.delete_recovery_for_tab(self.tab());
+            self.needs_tree_refresh = true;
+            self.message = format!("Saved {}", relative_path(&self.root, &path));
+        } else {
+            self.message = "Save failed".to_string();
+        }
+    }
+
+    fn save_current_tab_as(&mut self) {
+        let default = self.tab().path.as_ref().map(|p| relative_path(&self.root, p)).unwrap_or_default();
+        let name = self.prompt("Save as: ", &default);
+        if name.trim().is_empty() { self.message = "Save as cancelled".to_string(); return; }
+        let path = absolute_path(Path::new(name.trim()), Some(&self.root));
+        let old_path = self.tab().path.clone();
+        {
+            let tab = self.tab_mut();
+            tab.path = Some(path.clone());
+            tab.name = path.file_name().and_then(OsStr::to_str).unwrap_or("Untitled").to_string();
+        }
+        self.save_current_tab();
+        if let Some(old) = old_path { if old != path { self.delete_recovery_file(&old); } }
+    }
+
+    fn confirm_quit(&mut self) {
+        if self.tabs.iter().any(|t| t.modified) {
+            let ans = self.prompt("Unsaved changes. Quit? y/N: ", "");
+            if ans.to_ascii_lowercase() != "y" {
+                self.message = "Quit cancelled".to_string();
+                return;
+            }
+        }
+        self.running = false;
+    }
+
+    fn mark_edited(&mut self) {
+        let tab = self.tab_mut();
+        tab.revision += 1;
+        tab.modified = tab.revision != tab.saved_revision;
+        self.write_recovery_for_current_tab();
+    }
+
+    fn push_history(&mut self, entry: HistoryEntry) {
+        if entry.ops.is_empty() { return; }
+        let tab = self.tab_mut();
+        tab.undo.push(entry);
+        if tab.undo.len() > HISTORY_LIMIT { tab.undo.remove(0); }
+        tab.redo.clear();
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        let before = self.tab().cursor;
+        let mut ops = Vec::new();
+        if let Some((a, b)) = self.selection_range() {
+            let deleted = self.apply_delete_range(a, b);
+            ops.push(TextOp::Delete { pos: a, text: deleted });
+        }
+        let pos = self.tab().cursor;
+        let end = self.apply_insert_at(pos, text);
+        ops.push(TextOp::Insert { pos, text: text.to_string() });
+        self.tab_mut().cursor = end;
+        self.clear_selection();
+        let after = self.tab().cursor;
+        self.push_history(HistoryEntry { ops, before, after });
+        self.mark_edited();
+    }
+
+    fn insert_newline(&mut self) {
+        let cursor = self.tab().cursor;
+        let line = self.tab().lines[cursor.line].clone();
+        let before = &line[..cursor.col];
+        let after = &line[cursor.col..];
+        let indent = indent_for_newline(before, after);
+        self.insert_text(&format!("\n{indent}"));
+    }
+
+    fn insert_auto_closed_pair(&mut self, open: &str) -> bool {
+        let close = match open { "(" => ")", "{" => "}", _ => return false };
+        let before = self.tab().cursor;
+        let mut ops = Vec::new();
+        if let Some((a, b)) = self.selection_range() {
+            let deleted = self.apply_delete_range(a, b);
+            ops.push(TextOp::Delete { pos: a, text: deleted });
+        }
+        let pos = self.tab().cursor;
+        let pair = format!("{open}{close}");
+        let _end = self.apply_insert_at(pos, &pair);
+        self.tab_mut().cursor = Pos { line: pos.line, col: pos.col + open.len() };
+        ops.push(TextOp::Insert { pos, text: pair });
+        self.clear_selection();
+        let after = self.tab().cursor;
+        self.push_history(HistoryEntry { ops, before, after });
+        self.mark_edited();
+        self.message = format!("Closed {open}{close}");
+        true
+    }
+
+    fn auto_close_html_tag(&mut self) {
+        let syntax = self.tab().syntax();
+        if matches!(syntax, SyntaxMode::Plain | SyntaxMode::Css | SyntaxMode::JavaScript) { return; }
+        let cursor = self.tab().cursor;
+        let line = self.tab().lines[cursor.line].clone();
+        let before = &line[..cursor.col];
+        if before.trim_end().ends_with("/>") { return; }
+        let Some(tag) = plugins::html::last_unclosed_tag(before) else { return; };
+        if plugins::html::is_void_tag(&tag) { return; }
+        let closing = format!("</{tag}>");
+        let pos = self.tab().cursor;
+        let end = self.apply_insert_at(pos, &closing);
+        self.tab_mut().cursor = pos;
+        self.push_history(HistoryEntry { ops: vec![TextOp::Insert { pos, text: closing.clone() }], before: pos, after: end });
+        self.mark_edited();
+        self.message = format!("Closed <{tag}>");
+    }
+
+    fn backspace(&mut self) {
+        if let Some((a, b)) = self.selection_range() {
+            let before = self.tab().cursor;
+            let deleted = self.apply_delete_range(a, b);
+            self.push_history(HistoryEntry { ops: vec![TextOp::Delete { pos: a, text: deleted }], before, after: a });
+            self.clear_selection();
+            self.mark_edited();
+            return;
+        }
+        let cursor = self.tab().cursor;
+        if cursor.line == 0 && cursor.col == 0 { return; }
+        let start = if cursor.col > 0 {
+            Pos { line: cursor.line, col: prev_char_boundary(&self.tab().lines[cursor.line], cursor.col) }
+        } else {
+            let prev_len = self.tab().lines[cursor.line - 1].len();
+            Pos { line: cursor.line - 1, col: prev_len }
+        };
+        let deleted = self.apply_delete_range(start, cursor);
+        self.push_history(HistoryEntry { ops: vec![TextOp::Delete { pos: start, text: deleted }], before: cursor, after: start });
+        self.clear_selection();
+        self.mark_edited();
+    }
+
+    fn delete_forward(&mut self) {
+        if let Some((a, b)) = self.selection_range() {
+            let before = self.tab().cursor;
+            let deleted = self.apply_delete_range(a, b);
+            self.push_history(HistoryEntry { ops: vec![TextOp::Delete { pos: a, text: deleted }], before, after: a });
+            self.clear_selection();
+            self.mark_edited();
+            return;
+        }
+        let cursor = self.tab().cursor;
+        if cursor.line == self.tab().lines.len() - 1 && cursor.col == self.tab().lines[cursor.line].len() { return; }
+        let end = if cursor.col < self.tab().lines[cursor.line].len() {
+            Pos { line: cursor.line, col: next_char_boundary(&self.tab().lines[cursor.line], cursor.col) }
+        } else {
+            Pos { line: cursor.line + 1, col: 0 }
+        };
+        let deleted = self.apply_delete_range(cursor, end);
+        self.push_history(HistoryEntry { ops: vec![TextOp::Delete { pos: cursor, text: deleted }], before: cursor, after: cursor });
+        self.clear_selection();
+        self.mark_edited();
+    }
+
+    fn delete_current_line(&mut self) {
+        let before = self.tab().cursor;
+        let line = before.line;
+        let start = Pos { line, col: 0 };
+        let end = if line + 1 < self.tab().lines.len() { Pos { line: line + 1, col: 0 } } else { Pos { line, col: self.tab().lines[line].len() } };
+        let deleted = self.apply_delete_range(start, end);
+        let after = Pos { line: min(line, self.tab().lines.len().saturating_sub(1)), col: 0 };
+        self.tab_mut().cursor = after;
+        self.push_history(HistoryEntry { ops: vec![TextOp::Delete { pos: start, text: deleted }], before, after });
+        self.clear_selection();
+        self.mark_edited();
+        self.message = "Line removed".to_string();
+    }
+
+    fn apply_insert_at(&mut self, pos: Pos, text: &str) -> Pos {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let parts: Vec<&str> = text.split('\n').collect();
+        let tab = self.tab_mut();
+        let line = min(pos.line, tab.lines.len().saturating_sub(1));
+        let col = clamp_char_boundary(&tab.lines[line], min(pos.col, tab.lines[line].len()));
+        if parts.len() == 1 {
+            tab.lines[line].insert_str(col, parts[0]);
+            return Pos { line, col: col + parts[0].len() };
+        }
+        let original = tab.lines[line].clone();
+        let before = original[..col].to_string();
+        let after = original[col..].to_string();
+        tab.lines[line] = format!("{}{}", before, parts[0]);
+        let mut insert_at = line + 1;
+        for mid in &parts[1..parts.len() - 1] {
+            tab.lines.insert(insert_at, (*mid).to_string());
+            insert_at += 1;
+        }
+        let last = format!("{}{}", parts.last().unwrap(), after);
+        tab.lines.insert(insert_at, last);
+        Pos { line: insert_at, col: parts.last().unwrap().len() }
+    }
+
+    fn apply_delete_range(&mut self, mut start: Pos, mut end: Pos) -> String {
+        if pos_gt(start, end) { std::mem::swap(&mut start, &mut end); }
+        let tab = self.tab_mut();
+        start.line = min(start.line, tab.lines.len().saturating_sub(1));
+        end.line = min(end.line, tab.lines.len().saturating_sub(1));
+        start.col = clamp_char_boundary(&tab.lines[start.line], min(start.col, tab.lines[start.line].len()));
+        end.col = clamp_char_boundary(&tab.lines[end.line], min(end.col, tab.lines[end.line].len()));
+        let deleted = text_between(&tab.lines, start, end);
+        if start.line == end.line {
+            tab.lines[start.line].replace_range(start.col..end.col, "");
+        } else {
+            let before = tab.lines[start.line][..start.col].to_string();
+            let after = tab.lines[end.line][end.col..].to_string();
+            tab.lines[start.line] = before + &after;
+            for _ in start.line + 1..=end.line {
+                tab.lines.remove(start.line + 1);
+            }
+        }
+        if tab.lines.is_empty() { tab.lines.push(String::new()); }
+        tab.cursor = start;
+        deleted
+    }
+
+    fn undo(&mut self) {
+        let Some(entry) = self.tab_mut().undo.pop() else { self.message = "Nothing to undo".to_string(); return; };
+        for op in entry.ops.iter().rev() {
+            match op {
+                TextOp::Insert { pos, text } => {
+                    let end = end_pos_for_text(*pos, text);
+                    self.apply_delete_range(*pos, end);
+                }
+                TextOp::Delete { pos, text } => {
+                    self.apply_insert_at(*pos, text);
+                }
+            }
+        }
+        self.tab_mut().cursor = entry.before;
+        self.tab_mut().redo.push(entry);
+        self.mark_edited();
+        self.message = "Undo".to_string();
+    }
+
+    fn redo(&mut self) {
+        let Some(entry) = self.tab_mut().redo.pop() else { self.message = "Nothing to redo".to_string(); return; };
+        for op in &entry.ops {
+            match op {
+                TextOp::Insert { pos, text } => { self.apply_insert_at(*pos, text); }
+                TextOp::Delete { pos, text } => {
+                    let end = end_pos_for_text(*pos, text);
+                    self.apply_delete_range(*pos, end);
+                }
+            }
+        }
+        self.tab_mut().cursor = entry.after;
+        self.tab_mut().undo.push(entry);
+        self.mark_edited();
+        self.message = "Redo".to_string();
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        self.selection_range().map(|(a, b)| text_between(&self.tab().lines, a, b))
+    }
+
+    fn selection_range(&self) -> Option<(Pos, Pos)> {
+        let anchor = self.selection_anchor?;
+        let cursor = self.tab().cursor;
+        if anchor == cursor { return None; }
+        if pos_gt(anchor, cursor) { Some((cursor, anchor)) } else { Some((anchor, cursor)) }
+    }
+
+    fn prepare_selection(&mut self, select: bool) {
+        if select {
+            if self.selection_anchor.is_none() { self.selection_anchor = Some(self.tab().cursor); }
+        } else {
+            self.selection_anchor = None;
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    fn copy_selection_or_line(&mut self) {
+        let text = self.selected_text().unwrap_or_else(|| self.tab().lines[self.tab().cursor.line].clone());
+        self.clipboard = text.clone();
+        self.copy_to_system_clipboard(&text);
+        self.message = "Copied".to_string();
+    }
+
+    fn cut_selection_or_line(&mut self) {
+        let before = self.tab().cursor;
+        if let Some((a, b)) = self.selection_range() {
+            let deleted = self.apply_delete_range(a, b);
+            self.clipboard = deleted.clone();
+            self.copy_to_system_clipboard(&deleted);
+            self.push_history(HistoryEntry { ops: vec![TextOp::Delete { pos: a, text: deleted }], before, after: a });
+        } else {
+            let line = before.line;
+            let start = Pos { line, col: 0 };
+            let end = if line + 1 < self.tab().lines.len() { Pos { line: line + 1, col: 0 } } else { Pos { line, col: self.tab().lines[line].len() } };
+            let deleted = self.apply_delete_range(start, end);
+            self.clipboard = deleted.clone();
+            self.copy_to_system_clipboard(&deleted);
+            self.push_history(HistoryEntry { ops: vec![TextOp::Delete { pos: start, text: deleted }], before, after: start });
+        }
+        self.clear_selection();
+        self.mark_edited();
+        self.message = "Cut".to_string();
+    }
+
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_empty() { self.message = "Clipboard empty".to_string(); return; }
+        let text = self.clipboard.clone();
+        self.insert_text(&text);
+        self.message = "Pasted".to_string();
+    }
+
+    fn select_all(&mut self) {
+        self.selection_anchor = Some(Pos { line: 0, col: 0 });
+        let last_line = self.tab().lines.len().saturating_sub(1);
+        let last_col = self.tab().lines[last_line].len();
+        self.tab_mut().cursor = Pos { line: last_line, col: last_col };
+        self.message = "Selected all".to_string();
+    }
+
+    fn copy_to_system_clipboard(&self, text: &str) {
+        let encoded = base64_encode(text.as_bytes());
+        print!("\x1b]52;c;{}\x07", encoded);
+        let _ = io::stdout().flush();
+    }
+
+    fn move_cursor(&mut self, line_delta: isize, col_delta: isize, select: bool) {
+        self.prepare_selection(select);
+        let tab = self.tab_mut();
+        let line = if line_delta < 0 {
+            tab.cursor.line.saturating_sub((-line_delta) as usize)
+        } else {
+            min(tab.lines.len().saturating_sub(1), tab.cursor.line + line_delta as usize)
+        };
+        let mut col = if col_delta < 0 {
+            tab.cursor.col.saturating_sub((-col_delta) as usize)
+        } else {
+            tab.cursor.col + col_delta as usize
+        };
+        col = min(col, tab.lines[line].len());
+        col = clamp_char_boundary(&tab.lines[line], col);
+        tab.cursor = Pos { line, col };
+    }
+
+    fn move_left(&mut self, select: bool) {
+        self.prepare_selection(select);
+        let cursor = self.tab().cursor;
+        if cursor.col > 0 {
+            let col = prev_char_boundary(&self.tab().lines[cursor.line], cursor.col);
+            self.tab_mut().cursor.col = col;
+        } else if cursor.line > 0 {
+            let prev_len = self.tab().lines[cursor.line - 1].len();
+            self.tab_mut().cursor = Pos { line: cursor.line - 1, col: prev_len };
+        }
+    }
+
+    fn move_right(&mut self, select: bool) {
+        self.prepare_selection(select);
+        let cursor = self.tab().cursor;
+        let len = self.tab().lines[cursor.line].len();
+        if cursor.col < len {
+            let col = next_char_boundary(&self.tab().lines[cursor.line], cursor.col);
+            self.tab_mut().cursor.col = col;
+        } else if cursor.line + 1 < self.tab().lines.len() {
+            self.tab_mut().cursor = Pos { line: cursor.line + 1, col: 0 };
+        }
+    }
+
+    fn home(&mut self, select: bool) {
+        self.prepare_selection(select);
+        self.tab_mut().cursor.col = 0;
+    }
+
+    fn end(&mut self, select: bool) {
+        self.prepare_selection(select);
+        let line = self.tab().cursor.line;
+        let len = self.tab().lines[line].len();
+        self.tab_mut().cursor.col = len;
+    }
+
+    fn page(&mut self, direction: isize, select: bool) {
+        let delta = direction * self.content_height as isize;
+        self.move_cursor(delta, 0, select);
+    }
+
+    fn move_word_left(&mut self, select: bool) {
+        self.prepare_selection(select);
+        let mut pos = self.tab().cursor;
+        if pos.line == 0 && pos.col == 0 { return; }
+        if pos.col == 0 {
+            pos.line -= 1;
+            pos.col = self.tab().lines[pos.line].len();
+        }
+        let line = &self.tab().lines[pos.line];
+        let mut col = prev_char_boundary(line, pos.col);
+        while col > 0 && is_space_char(prev_char(line, col)) {
+            col = prev_char_boundary(line, col);
+        }
+        while col > 0 && is_word_char(prev_char(line, col)) {
+            col = prev_char_boundary(line, col);
+        }
+        self.tab_mut().cursor = Pos { line: pos.line, col };
+    }
+
+    fn move_word_right(&mut self, select: bool) {
+        self.prepare_selection(select);
+        let mut pos = self.tab().cursor;
+        let lines_len = self.tab().lines.len();
+        loop {
+            let line = &self.tab().lines[pos.line];
+            if pos.col >= line.len() {
+                if pos.line + 1 >= lines_len { break; }
+                pos.line += 1;
+                pos.col = 0;
+                break;
+            }
+            while pos.col < line.len() && is_word_char(next_char(line, pos.col)) {
+                pos.col = next_char_boundary(line, pos.col);
+            }
+            while pos.col < line.len() && is_space_char(next_char(line, pos.col)) {
+                pos.col = next_char_boundary(line, pos.col);
+            }
+            break;
+        }
+        self.tab_mut().cursor = pos;
+    }
+
+    fn go_to_line_prompt(&mut self) {
+        let value = self.prompt("Go to line: ", "");
+        if let Ok(n) = value.trim().parse::<usize>() {
+            self.go_to_line(n);
+        } else {
+            self.message = "Go to line cancelled".to_string();
+        }
+    }
+
+    fn go_to_line(&mut self, line: usize) {
+        let line = line.saturating_sub(1);
+        let max_line = self.tab().lines.len().saturating_sub(1);
+        self.tab_mut().cursor.line = min(line, max_line);
+        let l = self.tab().cursor.line;
+        let c = min(self.tab().cursor.col, self.tab().lines[l].len());
+        self.tab_mut().cursor.col = clamp_char_boundary(&self.tab().lines[l], c);
+        self.clear_selection();
+        self.message = format!("Line {}", self.tab().cursor.line + 1);
+    }
+
+    fn parse_find_query(&self, query: &str) -> (String, bool) {
+        if let Some(rest) = query.strip_prefix('%') {
+            (rest.to_string(), false)
+        } else {
+            (query.to_string(), true)
+        }
+    }
+
+    fn find_prompt(&mut self) {
+        let default = self.last_find.clone();
+        let query = self.prompt("Find: ", &default);
+        if query.is_empty() { self.message = "Find cancelled".to_string(); return; }
+        self.last_find = query.clone();
+        self.find_next(&query);
+    }
+
+    fn find_next(&mut self, query: &str) -> bool {
+        let (needle, ignore_case) = self.parse_find_query(query);
+        if needle.is_empty() { self.message = "Empty search".to_string(); return false; }
+        let start = self.tab().cursor;
+        let total = self.tab().lines.len();
+        for pass in 0..2 {
+            let range: Box<dyn Iterator<Item = usize>> = if pass == 0 {
+                Box::new(start.line..total)
+            } else {
+                Box::new(0..=start.line)
+            };
+            for line_no in range {
+                let offset = if line_no == start.line && pass == 0 { min(start.col + 1, self.tab().lines[line_no].len()) } else { 0 };
+                if let Some(pos) = find_in_line(&self.tab().lines[line_no], &needle, offset, ignore_case) {
+                    self.tab_mut().cursor = Pos { line: line_no, col: pos };
+                    self.selection_anchor = Some(Pos { line: line_no, col: pos + needle.len() });
+                    self.message = format!("Found {}", needle);
+                    return true;
+                }
+            }
+        }
+        self.message = "Not found".to_string();
+        false
+    }
+
+    fn replace_prompt(&mut self) {
+        let query = self.prompt("Replace: ", &self.last_find.clone());
+        if query.is_empty() { self.message = "Replace cancelled".to_string(); return; }
+        self.last_find = query.clone();
+        let replacement = self.prompt("Replace with: ", "");
+        let mode = self.prompt("Replace all? y/N: ", "");
+        if mode.to_ascii_lowercase() == "y" {
+            self.replace_all(&query, &replacement);
+        } else {
+            self.replace_one(&query, &replacement);
+        }
+    }
+
+    fn replace_one(&mut self, query: &str, replacement: &str) {
+        if !self.find_next(query) { return; }
+        if let Some((a, b)) = self.selection_range() {
+            let before = self.tab().cursor;
+            let deleted = self.apply_delete_range(a, b);
+            let end = self.apply_insert_at(a, replacement);
+            self.tab_mut().cursor = end;
+            self.push_history(HistoryEntry {
+                ops: vec![TextOp::Delete { pos: a, text: deleted }, TextOp::Insert { pos: a, text: replacement.to_string() }],
+                before,
+                after: end,
+            });
+            self.clear_selection();
+            self.mark_edited();
+            self.message = "Replaced".to_string();
+        }
+    }
+
+    fn replace_all(&mut self, query: &str, replacement: &str) {
+        let (needle, ignore_case) = self.parse_find_query(query);
+        if needle.is_empty() { self.message = "Empty search".to_string(); return; }
+        let before = self.tab().cursor;
+        let mut ops = Vec::new();
+        let mut count = 0usize;
+        let mut line_no = 0usize;
+        while line_no < self.tab().lines.len() {
+            let mut offset = 0usize;
+            while let Some(pos) = find_in_line(&self.tab().lines[line_no], &needle, offset, ignore_case) {
+                let start = Pos { line: line_no, col: pos };
+                let end = Pos { line: line_no, col: pos + needle.len() };
+                let deleted = self.apply_delete_range(start, end);
+                let end_pos = self.apply_insert_at(start, replacement);
+                ops.push(TextOp::Delete { pos: start, text: deleted });
+                ops.push(TextOp::Insert { pos: start, text: replacement.to_string() });
+                count += 1;
+                offset = end_pos.col;
+                if replacement.is_empty() && offset >= self.tab().lines[line_no].len() { break; }
+                if ops.len() > 20_000 { break; }
+            }
+            if ops.len() > 20_000 { break; }
+            line_no += 1;
+        }
+        if count > 0 {
+            let after = self.tab().cursor;
+            self.push_history(HistoryEntry { ops, before, after });
+            self.mark_edited();
+            self.message = format!("Replaced {count}");
+        } else {
+            self.message = "No matches".to_string();
+        }
+    }
+
+    fn prompt(&mut self, label: &str, default: &str) -> String {
+        let mut value = default.to_string();
+        loop {
+            let _ = self.render();
+            let text = format!(" az> {label}{value}");
+            print!("\x1b[{};1H{}{}\x1b[0m", self.status_line, ansi_style(Some(FG), Some(BG_HIGHLIGHT), true, false, false), fit_plain(&text, self.cols));
+            let cursor_col = min(self.cols, 6 + label.len() + value.len());
+            print!("\x1b[{};{}H\x1b[?25h", self.status_line, max(1, cursor_col));
+            let _ = io::stdout().flush();
+            let key = self.read_key_blocking().unwrap_or_default();
+            match key.as_str() {
+                "\r" | "\n" => return value,
+                "\x1b" => return String::new(),
+                "\x7f" | "\x08" => { remove_last_char(&mut value); }
+                "\x15" => value.clear(),
+                _ => {
+                    if let Some(pasted) = key.strip_prefix("\0AZPASTE:") {
+                        value.push_str(&pasted.replace('\r', " ").replace('\n', " "));
+                    } else if is_printable(&key) {
+                        value.push_str(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    fn quick_open(&mut self) {
+        let files = self.collect_quick_open_files(QUICK_OPEN_LIMIT);
+        let symbols = self.collect_quick_open_symbols(&files, QUICK_OPEN_LIMIT);
+        let mut query = String::new();
+        let mut selected = 0usize;
+        loop {
+            let (bare_line, q, line) = parse_quick_open_query(&query);
+            let matches = if bare_line { Vec::new() } else { self.filter_quick_open_items(&files, &symbols, &q) };
+            selected = min(selected, matches.len().saturating_sub(1));
+            self.render_quick_open(&query, &matches, selected);
+            let key = self.read_key_blocking().unwrap_or_default();
+            match key.as_str() {
+                "\r" | "\n" => {
+                    if bare_line {
+                        if let Some(n) = line { self.go_to_line(n); }
+                    } else if let Some(item) = matches.get(selected) {
+                        if let Some(path) = &item.path {
+                            self.open_file(path.clone(), false);
+                            if let Some(n) = item.line { self.go_to_line(n); }
+                        }
+                    } else {
+                        self.message = "No match".to_string();
+                    }
+                    return;
+                }
+                "\x1b" => { self.message = "Quick open cancelled".to_string(); return; }
+                "\x1b[A" | "\x10" => selected = selected.saturating_sub(1),
+                "\x1b[B" | "\x0e" => selected = min(matches.len().saturating_sub(1), selected + 1),
+                "\x7f" | "\x08" => { remove_last_char(&mut query); selected = 0; }
+                "\x15" => { query.clear(); selected = 0; }
+                _ => {
+                    if let Some(pasted) = key.strip_prefix("\0AZPASTE:") {
+                        query.push_str(&pasted.replace('\r', " ").replace('\n', " "));
+                        selected = 0;
+                    } else if is_printable(&key) {
+                        query.push_str(&key);
+                        selected = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_quick_open_files(&self, limit: usize) -> Vec<PickerItem> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.root.clone()];
+        let skip: HashSet<&str> = [".git", "node_modules", "vendor", ".idea", ".vscode"].into_iter().collect();
+        while let Some(dir) = stack.pop() {
+            if out.len() >= limit { break; }
+            let Ok(read) = fs::read_dir(&dir) else { continue; };
+            let mut dirs = Vec::new();
+            let mut files = Vec::new();
+            for entry in read.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    if !skip.contains(name.as_str()) { dirs.push(path); }
+                } else if path.is_file() { files.push(path); }
+            }
+            dirs.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
+            dirs.reverse();
+            for d in dirs { stack.push(d); }
+            files.sort_by_key(|p| p.to_string_lossy().to_ascii_lowercase());
+            for p in files {
+                let label = relative_path(&self.root, &p);
+                out.push(PickerItem { label, detail: "file".to_string(), path: Some(p), line: None, action: None });
+                if out.len() >= limit { break; }
+            }
+        }
+        out.sort_by_key(|i| i.label.to_ascii_lowercase());
+        out
+    }
+
+    fn collect_quick_open_symbols(&self, files: &[PickerItem], limit: usize) -> Vec<PickerItem> {
+        let mut out = Vec::new();
+        for file in files.iter().take(600) {
+            if out.len() >= limit { break; }
+            let Some(path) = &file.path else { continue; };
+            let syntax = SyntaxMode::from_path(Some(path));
+            if !plugins::is_programming_mode(syntax) { continue; }
+            let Ok(meta) = fs::metadata(path) else { continue; };
+            if meta.len() > 1024 * 1024 { continue; }
+            let Ok(text) = fs::read_to_string(path) else { continue; };
+            for (name, line) in extract_symbols(&text, syntax) {
+                out.push(PickerItem {
+                    label: format!("{}  #{}", file.label, name),
+                    detail: format!("symbol line {line}"),
+                    path: Some(path.clone()),
+                    line: Some(line),
+                    action: None,
+                });
+                if out.len() >= limit { break; }
+            }
+        }
+        out
+    }
+
+    fn filter_quick_open_items(&self, files: &[PickerItem], symbols: &[PickerItem], query: &str) -> Vec<PickerItem> {
+        let items: Vec<&PickerItem> = files.iter().chain(symbols.iter()).collect();
+        if query.trim().is_empty() { return files.iter().take(14).cloned().collect(); }
+        let mut ranked: Vec<(i32, PickerItem)> = Vec::new();
+        for item in items {
+            if let Some(score) = quick_score(&format!("{} {}", item.label, item.detail), query) {
+                ranked.push((score, item.clone()));
+            }
+        }
+        ranked.sort_by_key(|x| x.0);
+        ranked.into_iter().map(|x| x.1).take(14).collect()
+    }
+
+    fn render_quick_open(&mut self, query: &str, matches: &[PickerItem], selected: usize) {
+        let old = self.message.clone();
+        self.message = "Quick open".to_string();
+        let _ = self.render();
+        self.message = old;
+        self.render_simple_picker(" Quick Open ", if query.is_empty() { "type file, symbol, file:line, or :line" } else { query }, matches, selected, "No matching files");
+    }
+
+    fn command_palette(&mut self) {
+        let commands = self.command_items();
+        let mut query = String::new();
+        let mut selected = 0usize;
+        loop {
+            let matches = self.filter_command_items(&commands, &query);
+            selected = min(selected, matches.len().saturating_sub(1));
+            let old = self.message.clone();
+            self.message = "Command palette".to_string();
+            let _ = self.render();
+            self.message = old;
+            self.render_simple_picker(" Command Palette ", if query.is_empty() { "type a command" } else { &query }, &matches, selected, "No matching commands");
+            let key = self.read_key_blocking().unwrap_or_default();
+            match key.as_str() {
+                "\r" | "\n" => {
+                    if let Some(item) = matches.get(selected) {
+                        if let Some(action) = &item.action { self.run_command(action); }
+                    }
+                    return;
+                }
+                "\x1b" => { self.message = "Command cancelled".to_string(); return; }
+                "\x1b[A" | "\x10" => selected = selected.saturating_sub(1),
+                "\x1b[B" | "\x0e" => selected = min(matches.len().saturating_sub(1), selected + 1),
+                "\x7f" | "\x08" => { remove_last_char(&mut query); selected = 0; }
+                "\x15" => { query.clear(); selected = 0; }
+                _ => {
+                    if let Some(pasted) = key.strip_prefix("\0AZPASTE:") {
+                        query.push_str(&pasted.replace('\r', " ").replace('\n', " "));
+                        selected = 0;
+                    } else if is_printable(&key) {
+                        query.push_str(&key);
+                        selected = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    fn command_items(&self) -> Vec<PickerItem> {
+        let defs = [
+            ("Save", "Ctrl+S", "save"),
+            ("Save as", "save current tab to a new path", "save-as"),
+            ("New file", "create file in project", "new-file"),
+            ("New folder", "create folder in project", "new-folder"),
+            ("Rename selected file or folder", "tree/current file", "rename-path"),
+            ("Delete selected file or folder", "asks first", "delete-path"),
+            ("Go to line", "Ctrl+G", "go-line"),
+            ("Search project", "find text in files", "project-search"),
+            ("Set syntax PHP", "force current tab to PHP", "set-syntax-php"),
+            ("Set syntax Blade", "force current tab to Blade", "set-syntax-blade"),
+            ("Set syntax HTML", "force current tab to HTML", "set-syntax-html"),
+            ("Set syntax CSS", "force current tab to CSS", "set-syntax-css"),
+            ("Set syntax JavaScript", "force current tab to JavaScript", "set-syntax-javascript"),
+            ("Set syntax Auto", "use file extension again", "set-syntax-auto"),
+            ("Set syntax Plain", "disable highlighting/completion", "set-syntax-plain"),
+            ("Find in current file", "Ctrl+F", "find"),
+            ("Replace in current file", "Ctrl+R", "replace"),
+            ("Toggle sidebar", "Ctrl+H", "toggle-tree"),
+            ("Focus tree/editor", "Ctrl+T", "focus-tree"),
+            ("Close tab", "Ctrl+D", "close-tab"),
+            ("Demo mode", "show welcome, command palette, quick open", "demo-mode"),
+            ("Welcome screen", "Ctrl+/", "help"),
+            ("Quit", "Ctrl+Q", "quit"),
+        ];
+        defs.iter().map(|(l, d, a)| PickerItem { label: (*l).to_string(), detail: (*d).to_string(), path: None, line: None, action: Some((*a).to_string()) }).collect()
+    }
+
+    fn filter_command_items(&self, commands: &[PickerItem], query: &str) -> Vec<PickerItem> {
+        if query.trim().is_empty() { return commands.iter().take(18).cloned().collect(); }
+        let mut ranked = Vec::new();
+        for cmd in commands {
+            if let Some(score) = quick_score(&format!("{} {}", cmd.label, cmd.detail), query) {
+                ranked.push((score, cmd.clone()));
+            }
+        }
+        ranked.sort_by_key(|x| x.0);
+        ranked.into_iter().map(|x| x.1).take(12).collect()
+    }
+
+    fn run_command(&mut self, action: &str) {
+        match action {
+            "save" => self.save_current_tab(),
+            "save-as" => self.save_current_tab_as(),
+            "new-file" => self.create_file_prompt(None),
+            "new-folder" => self.create_folder_prompt(None),
+            "rename-path" => self.rename_tree_path_prompt(true),
+            "delete-path" => self.delete_tree_path_prompt(true),
+            "go-line" => self.go_to_line_prompt(),
+            "project-search" => self.project_search_prompt(),
+            "set-syntax-php" => self.set_current_syntax(Some(SyntaxMode::Php)),
+            "set-syntax-blade" => self.set_current_syntax(Some(SyntaxMode::Blade)),
+            "set-syntax-html" => self.set_current_syntax(Some(SyntaxMode::Html)),
+            "set-syntax-css" => self.set_current_syntax(Some(SyntaxMode::Css)),
+            "set-syntax-javascript" => self.set_current_syntax(Some(SyntaxMode::JavaScript)),
+            "set-syntax-plain" => self.set_current_syntax(Some(SyntaxMode::Plain)),
+            "set-syntax-auto" => self.set_current_syntax(None),
+            "find" => self.find_prompt(),
+            "replace" => self.replace_prompt(),
+            "toggle-tree" => self.toggle_sidebar(),
+            "focus-tree" => self.toggle_tree_focus(),
+            "close-tab" => self.close_current_tab(),
+            "demo-mode" => self.show_demo_mode(),
+            "help" => self.show_shortcuts_help(),
+            "quit" => self.confirm_quit(),
+            _ => self.message = "Unknown command".to_string(),
+        }
+    }
+
+    fn render_simple_picker(&self, title: &str, query_line: &str, matches: &[PickerItem], selected: usize, empty: &str) {
+        let rows = min(12, max(1, self.rows.saturating_sub(8)));
+        let panel_width = min(self.cols.saturating_sub(6), max(50, self.cols * 62 / 100)).max(30);
+        let panel_height = rows + 4;
+        let start_col = max(1, (self.cols.saturating_sub(panel_width)) / 2 + 1);
+        let start_row = max(2, (self.rows.saturating_sub(panel_height)) / 2 + 1);
+        let inner = panel_width.saturating_sub(2);
+        let border = ansi_style(Some(BLUE), Some(BG_FLOAT), true, false, false);
+        let query_style = ansi_style(Some(FG), Some(BG_HIGHLIGHT), false, false, false);
+        let mut out = String::new();
+        out.push_str("\x1b[?25l");
+        out.push_str(&format!("\x1b[{start_row};{start_col}H{border}╔{}╗\x1b[0m", "═".repeat(inner)));
+        out.push_str(&format!("\x1b[{};{start_col}H{border}║\x1b[0m{}{}\x1b[0m{border}║\x1b[0m", start_row + 1, ansi_style(Some(ACCENT), Some(BG_FLOAT), true, false, false), fit_plain(title, inner)));
+        out.push_str(&format!("\x1b[{};{start_col}H{border}║\x1b[0m{query_style}{}\x1b[0m{border}║\x1b[0m", start_row + 2, fit_plain(query_line, inner)));
+        out.push_str(&format!("\x1b[{};{start_col}H{border}╠{}╣\x1b[0m", start_row + 3, "═".repeat(inner)));
+        for i in 0..rows {
+            let row = start_row + 4 + i;
+            let text = if let Some(item) = matches.get(i) {
+                let prefix = if i == selected { " › " } else { "   " };
+                let left = format!("{prefix}{}", item.label);
+                let right = if item.detail.is_empty() { String::new() } else { format!("  {}", item.detail) };
+                let spaces = inner.saturating_sub(visual_width(&left) + visual_width(&right)).max(1);
+                format!("{left}{}{right}", " ".repeat(spaces))
+            } else if matches.is_empty() && i == 0 {
+                format!("   {empty}")
+            } else { String::new() };
+            let style = if i == selected && matches.get(i).is_some() { ansi_style(Some(BG_DARK), Some(ACCENT), true, false, false) } else { ansi_style(Some(FG), Some(BG_FLOAT), false, false, false) };
+            out.push_str(&format!("\x1b[{row};{start_col}H{border}║\x1b[0m{style}{}\x1b[0m{border}║\x1b[0m", fit_plain(&text, inner)));
+        }
+        out.push_str(&format!("\x1b[{};{start_col}H{border}╚{}╝\x1b[0m", start_row + panel_height - 1, "═".repeat(inner)));
+        print!("{out}");
+        let _ = io::stdout().flush();
+    }
+
+    fn project_search_prompt(&mut self) {
+        let mut query = String::new();
+        let mut selected = 0usize;
+        loop {
+            let matches = if query.is_empty() { Vec::new() } else { self.collect_project_search_results(&query, PROJECT_SEARCH_LIMIT) };
+            selected = min(selected, matches.len().saturating_sub(1));
+            let old = self.message.clone();
+            self.message = "Project search".to_string();
+            let _ = self.render();
+            self.message = old;
+            self.render_simple_picker(" Project Search ", if query.is_empty() { "type text to search project" } else { &query }, &matches, selected, "No matches");
+            let key = self.read_key_blocking().unwrap_or_default();
+            match key.as_str() {
+                "\r" | "\n" => {
+                    if let Some(item) = matches.get(selected) {
+                        if let Some(path) = &item.path {
+                            self.open_file(path.clone(), false);
+                            if let Some(line) = item.line { self.go_to_line(line); }
+                        }
+                    } else { self.message = if query.is_empty() { "Search cancelled" } else { "No match" }.to_string(); }
+                    return;
+                }
+                "\x1b" => { self.message = "Search cancelled".to_string(); return; }
+                "\x1b[A" | "\x10" => selected = selected.saturating_sub(1),
+                "\x1b[B" | "\x0e" => selected = min(matches.len().saturating_sub(1), selected + 1),
+                "\x7f" | "\x08" => { remove_last_char(&mut query); selected = 0; }
+                "\x15" => { query.clear(); selected = 0; }
+                _ => {
+                    if let Some(pasted) = key.strip_prefix("\0AZPASTE:") {
+                        query.push_str(&pasted.replace('\r', " ").replace('\n', " "));
+                        selected = 0;
+                    } else if is_printable(&key) {
+                        query.push_str(&key);
+                        selected = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_project_search_results(&self, query: &str, limit: usize) -> Vec<PickerItem> {
+        let files = self.collect_quick_open_files(3000);
+        let mut results = Vec::new();
+        for file in files {
+            if results.len() >= limit { break; }
+            let Some(path) = file.path else { continue; };
+            let Ok(meta) = fs::metadata(&path) else { continue; };
+            if meta.len() > 5 * 1024 * 1024 { continue; }
+            let Ok(text) = fs::read_to_string(&path) else { continue; };
+            for (i, line) in text.replace("\r\n", "\n").replace('\r', "\n").lines().enumerate() {
+                if line.to_ascii_lowercase().contains(&query.to_ascii_lowercase()) {
+                    results.push(PickerItem {
+                        label: format!("{}:{}", relative_path(&self.root, &path), i + 1),
+                        detail: truncate_plain(line.trim(), 42),
+                        path: Some(path.clone()),
+                        line: Some(i + 1),
+                        action: None,
+                    });
+                    if results.len() >= limit { break; }
+                }
+            }
+        }
+        results
+    }
+
+    fn selected_tree_path(&mut self, prefer_current_file: bool) -> PathBuf {
+        self.refresh_tree();
+        if !prefer_current_file {
+            if let Some(row) = self.tree_rows.get(self.tree_index) { return row.path.clone(); }
+        }
+        if let Some(path) = &self.tab().path { return path.clone(); }
+        self.tree_rows.get(self.tree_index).map(|r| r.path.clone()).unwrap_or_else(|| self.root.clone())
+    }
+
+    fn base_dir_for_tree_action(&mut self) -> PathBuf {
+        let path = self.selected_tree_path(false);
+        if path.is_dir() { path } else { path.parent().unwrap_or(&self.root).to_path_buf() }
+    }
+
+    fn new_tree_file_prompt(&mut self) { let base = self.base_dir_for_tree_action(); self.create_file_prompt(Some(base)); }
+    fn new_tree_folder_prompt(&mut self) { let base = self.base_dir_for_tree_action(); self.create_folder_prompt(Some(base)); }
+
+    fn create_file_prompt(&mut self, base_dir: Option<PathBuf>) {
+        let name = self.prompt("New file: ", "");
+        if name.trim().is_empty() { self.message = "New file cancelled".to_string(); return; }
+        let base = base_dir.unwrap_or_else(|| self.root.clone());
+        let path = absolute_path(Path::new(name.trim()), Some(&base));
+        if path.is_dir() { self.message = "That is a folder".to_string(); return; }
+        if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+        if !path.exists() && fs::write(&path, b"").is_err() { self.message = "Could not create file".to_string(); return; }
+        self.needs_tree_refresh = true;
+        self.open_file(path.clone(), false);
+        self.message = format!("Created {}", relative_path(&self.root, &path));
+    }
+
+    fn create_folder_prompt(&mut self, base_dir: Option<PathBuf>) {
+        let name = self.prompt("New folder: ", "");
+        if name.trim().is_empty() { self.message = "New folder cancelled".to_string(); return; }
+        let base = base_dir.unwrap_or_else(|| self.root.clone());
+        let path = absolute_path(Path::new(name.trim()), Some(&base));
+        if fs::create_dir_all(&path).is_err() { self.message = "Could not create folder".to_string(); return; }
+        if let Some(parent) = path.parent() { self.expanded.insert(parent.to_path_buf()); }
+        self.needs_tree_refresh = true;
+        self.reveal_path_in_tree(&path);
+        self.message = format!("Created folder {}", relative_path(&self.root, &path));
+    }
+
+    fn rename_tree_path_prompt(&mut self, prefer_current_file: bool) {
+        let path = self.selected_tree_path(prefer_current_file);
+        if path == self.root { self.message = "Cannot rename project root".to_string(); return; }
+        let default = path.file_name().and_then(OsStr::to_str).unwrap_or("");
+        let name = self.prompt("Rename to: ", default);
+        if name.trim().is_empty() || name.trim() == default { self.message = "Rename cancelled".to_string(); return; }
+        let new_path = absolute_path(Path::new(name.trim()), path.parent());
+        if new_path.exists() { self.message = "Target already exists".to_string(); return; }
+        if fs::rename(&path, &new_path).is_err() { self.message = "Rename failed".to_string(); return; }
+        let was_dir = new_path.is_dir();
+        for tab in &mut self.tabs {
+            if tab.path.as_ref() == Some(&path) {
+                tab.path = Some(new_path.clone());
+                tab.name = new_path.file_name().and_then(OsStr::to_str).unwrap_or("Untitled").to_string();
+            } else if was_dir {
+                if let Some(tp) = tab.path.clone() {
+                    if let Ok(rest) = tp.strip_prefix(&path) {
+                        tab.path = Some(new_path.join(rest));
+                    }
+                }
+            }
+        }
+        self.needs_tree_refresh = true;
+        self.reveal_path_in_tree(&new_path);
+        self.message = "Renamed".to_string();
+    }
+
+    fn delete_tree_path_prompt(&mut self, prefer_current_file: bool) {
+        let path = self.selected_tree_path(prefer_current_file);
+        if path == self.root { self.message = "Cannot delete project root".to_string(); return; }
+        let answer = self.prompt(&format!("Delete {}? y/N: ", path.file_name().and_then(OsStr::to_str).unwrap_or("path")), "");
+        if answer.to_ascii_lowercase() != "y" { self.message = "Delete cancelled".to_string(); return; }
+        let was_dir = path.is_dir();
+        let ok = if was_dir { fs::remove_dir_all(&path).is_ok() } else { fs::remove_file(&path).is_ok() };
+        if !ok { self.message = "Delete failed".to_string(); return; }
+        let mut i = self.tabs.len();
+        while i > 0 {
+            i -= 1;
+            let remove = self.tabs[i].path.as_ref().map(|p| p == &path || (was_dir && p.starts_with(&path))).unwrap_or(false);
+            if remove {
+                let tab = self.tabs.remove(i);
+                self.delete_recovery_for_tab(&tab);
+            }
+        }
+        if self.tabs.is_empty() { self.tabs.push(Tab::empty()); }
+        self.tab_index = min(self.tab_index, self.tabs.len() - 1);
+        self.needs_tree_refresh = true;
+        self.message = "Deleted".to_string();
+    }
+
+    fn reveal_path_in_tree(&mut self, path: &Path) {
+        let mut cur = path.parent();
+        while let Some(p) = cur {
+            self.expanded.insert(p.to_path_buf());
+            if p == self.root { break; }
+            cur = p.parent();
+        }
+        self.needs_tree_refresh = true;
+        self.refresh_tree();
+        if let Some(idx) = self.tree_rows.iter().position(|r| r.path == path) {
+            self.tree_index = idx;
+            self.ensure_tree_visible();
+        }
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_hidden = !self.sidebar_hidden;
+        if self.sidebar_hidden && self.focus == Focus::Tree { self.focus = Focus::Editor; }
+        self.message = if self.sidebar_hidden { "Tree hidden" } else { "Tree shown" }.to_string();
+    }
+
+    fn toggle_tree_focus(&mut self) {
+        if self.sidebar_hidden {
+            self.sidebar_hidden = false;
+            self.focus = Focus::Tree;
+            self.message = "Tree shown and focused".to_string();
+        } else {
+            self.focus = if self.focus == Focus::Tree { Focus::Editor } else { Focus::Tree };
+            self.message = if self.focus == Focus::Tree { "Tree focused" } else { "Editor focused" }.to_string();
+        }
+    }
+
+    fn switch_to_tab_number(&mut self, number: usize) {
+        let visible = self.visible_tab_indexes();
+        if let Some(idx) = visible.get(number.saturating_sub(1)) {
+            self.tab_index = *idx;
+            self.clear_selection();
+            self.message = format!("Tab {number}");
+        } else {
+            self.message = format!("No tab {number}");
+        }
+    }
+
+    fn set_current_syntax(&mut self, syntax: Option<SyntaxMode>) {
+        self.tab_mut().syntax_mode = syntax;
+        self.message = match syntax { Some(s) => format!("Syntax set to {}", s.label()), None => "Syntax set to AUTO".to_string() };
+        self.close_autocomplete();
+    }
+
+    fn show_demo_mode(&mut self) {
+        let _ = self.render();
+        let width = max(28, self.cols / 3);
+        let height = max(8, self.rows / 2);
+        let quick = vec!["main.rs".to_string(), "src/editor.rs".to_string(), "README.md".to_string(), "app.php  #function run".to_string()];
+        let cmd = vec!["Save                   Ctrl+S".to_string(), "Set syntax PHP         force current tab".to_string(), "Project search         find text in files".to_string(), "Welcome screen         Ctrl+/".to_string()];
+        let welcome = vec!["   __ _ ____".to_string(), "  / _` |_  /".to_string(), " | (_| |/ / ".to_string(), r"  \__,_/___|".to_string(), "Ctrl+O Quick open".to_string(), "Ctrl+P Command palette".to_string(), "Ctrl+T Tree/editor".to_string()];
+        self.render_demo_tile(2, 2, width, height, "Welcome", &welcome, None, &[0,1,2,3]);
+        self.render_demo_tile(2, 4 + width, width, height, "Quick Open", &quick, Some(0), &[]);
+        self.render_demo_tile(2, 6 + width * 2, self.cols.saturating_sub(7 + width * 2), height, "Command Palette", &cmd, Some(0), &[]);
+        let _ = self.read_key_blocking();
+        self.message = "Demo closed".to_string();
+    }
+
+    fn render_demo_tile(&self, row: usize, col: usize, width: usize, height: usize, title: &str, lines: &[String], selected: Option<usize>, logo_lines: &[usize]) {
+        if width < 8 || height < 4 || col > self.cols { return; }
+        let inner = width.saturating_sub(2);
+        let border = ansi_style(Some(BLUE), Some(BG_FLOAT), true, false, false);
+        let mut out = String::new();
+        out.push_str(&format!("\x1b[{row};{col}H{border}╔{}╗\x1b[0m", "═".repeat(inner)));
+        out.push_str(&format!("\x1b[{};{col}H{border}║\x1b[0m{}{}\x1b[0m{border}║\x1b[0m", row + 1, ansi_style(Some(ACCENT), Some(BG_FLOAT), true, false, false), fit_plain(title, inner)));
+        for i in 0..height.saturating_sub(3) {
+            let r = row + 2 + i;
+            let text = lines.get(i).map(String::as_str).unwrap_or("");
+            let style = if selected == Some(i) { ansi_style(Some(BG_DARK), Some(ACCENT), true, false, false) } else if logo_lines.contains(&i) { ansi_style(Some(ORANGE), Some(BG_FLOAT), true, false, false) } else { ansi_style(Some(FG), Some(BG_FLOAT), false, false, false) };
+            out.push_str(&format!("\x1b[{r};{col}H{border}║\x1b[0m{style}{}\x1b[0m{border}║\x1b[0m", fit_plain(text, inner)));
+        }
+        out.push_str(&format!("\x1b[{};{col}H{border}╚{}╝\x1b[0m", row + height - 1, "═".repeat(inner)));
+        print!("{out}");
+        let _ = io::stdout().flush();
+    }
+
+    fn handle_autocomplete_key(&mut self, key: &str) -> bool {
+        if key == "\t" {
+            if self.autocomplete_visible {
+                self.accept_autocomplete();
+                return true;
+            }
+            if self.refresh_autocomplete(true) { return true; }
+            self.insert_text("\t");
+            return true;
+        }
+        if !self.autocomplete_visible { return false; }
+        match key {
+            "\r" | "\n" => { self.accept_autocomplete(); true }
+            "\x1b" => { self.close_autocomplete(); self.message = "Autocomplete closed".to_string(); true }
+            "\x1b[A" => { self.autocomplete_index = self.autocomplete_index.saturating_sub(1); true }
+            "\x1b[B" => { self.autocomplete_index = min(self.autocomplete_items.len().saturating_sub(1), self.autocomplete_index + 1); true }
+            _ => false,
+        }
+    }
+
+    fn refresh_autocomplete(&mut self, explicit: bool) -> bool {
+        let Some((mode, prefix, start)) = self.autocomplete_context(explicit) else {
+            self.close_autocomplete(); return false;
+        };
+        let items = self.autocomplete_suggestions(&mode, &prefix);
+        if items.is_empty() { self.close_autocomplete(); return false; }
+        self.autocomplete_visible = true;
+        self.autocomplete_items = items;
+        self.autocomplete_index = 0;
+        self.autocomplete_line = self.tab().cursor.line;
+        self.autocomplete_start_col = start;
+        self.autocomplete_prefix = prefix;
+        true
+    }
+
+    fn close_autocomplete(&mut self) {
+        self.autocomplete_visible = false;
+        self.autocomplete_items.clear();
+        self.autocomplete_index = 0;
+        self.autocomplete_prefix.clear();
+    }
+
+    fn accept_autocomplete(&mut self) {
+        if !self.autocomplete_visible { return; }
+        let Some(item) = self.autocomplete_items.get(self.autocomplete_index).cloned() else { self.close_autocomplete(); return; };
+        if self.tab().cursor.line != self.autocomplete_line { self.close_autocomplete(); return; }
+        let start = Pos { line: self.autocomplete_line, col: self.autocomplete_start_col };
+        let end = self.tab().cursor;
+        let before = self.tab().cursor;
+        let deleted = self.apply_delete_range(start, end);
+        let end_pos = self.apply_insert_at(start, &item.insert);
+        self.tab_mut().cursor = end_pos;
+        self.push_history(HistoryEntry { ops: vec![TextOp::Delete { pos: start, text: deleted }, TextOp::Insert { pos: start, text: item.insert.clone() }], before, after: end_pos });
+        self.mark_edited();
+        self.clear_selection();
+        self.message = format!("Completed {}", item.label);
+        self.close_autocomplete();
+    }
+
+    fn autocomplete_context(&self, explicit: bool) -> Option<(String, String, usize)> {
+        let tab = self.tab();
+        let line = &tab.lines[tab.cursor.line];
+        let before = &line[..tab.cursor.col];
+        plugins::completion_context(tab.syntax(), before, explicit)
+    }
+
+    fn autocomplete_suggestions(&self, mode: &str, prefix: &str) -> Vec<CompletionItem> {
+        plugins::completion_items(mode, prefix, plugins::CompletionContext { lines: &self.tab().lines, scan_limit: HUGE_SCAN_LIMIT })
+    }
+
+
+    fn render_autocomplete_dropdown(&self, cursor_row: usize, cursor_col: usize) -> String {
+        if !self.autocomplete_visible || self.autocomplete_items.is_empty() { return String::new(); }
+        let max_items = min(8, self.autocomplete_items.len());
+        let width = min(52, max(28, self.editor_text_width() / 2));
+        let mut start_col = min(cursor_col, self.cols.saturating_sub(width).max(1));
+        if start_col < self.editor_start_col() { start_col = self.editor_start_col(); }
+        let mut start_row = cursor_row + 1;
+        if start_row + max_items >= self.status_line { start_row = max(2, cursor_row.saturating_sub(max_items)); }
+        let first = self.autocomplete_index.saturating_sub(4);
+        let mut out = String::new();
+        for (screen_i, item) in self.autocomplete_items.iter().enumerate().skip(first).take(max_items) {
+            let row = start_row + screen_i - first;
+            if row >= self.status_line { break; }
+            let detail_width = min(20, max(10, width * 28 / 100));
+            let label_width = width.saturating_sub(detail_width + 4).max(8);
+            let label = truncate_plain(&item.label, label_width);
+            let detail = truncate_plain(&item.detail, detail_width);
+            let spaces = width.saturating_sub(visual_width(&label) + visual_width(&detail) + 2).max(1);
+            let text = format!(" {label}{}{detail} ", " ".repeat(spaces));
+            let style = if screen_i == self.autocomplete_index { ansi_style(Some(BG_DARK), Some(ACCENT), true, false, false) } else { ansi_style(Some(FG), Some(BG_FLOAT), false, false, false) };
+            out.push_str(&format!("\x1b[{row};{start_col}H{style}{}\x1b[0m", fit_plain(&text, width)));
+        }
+        out
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        let base = env::var_os("XDG_STATE_HOME").map(PathBuf::from).unwrap_or_else(|| {
+            env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| env::temp_dir()).join(".local/state")
+        });
+        let dir = base.join("az-rust");
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn session_file(&self) -> PathBuf { self.state_dir().join(format!("session-{}.txt", simple_hash(self.root.to_string_lossy().as_bytes()))) }
+    fn recovery_dir(&self) -> PathBuf { let d = self.state_dir().join("recovery"); let _ = fs::create_dir_all(&d); d }
+    fn recovery_file_for(&self, tab: &Tab) -> PathBuf {
+        let key = match &tab.path { Some(p) => p.to_string_lossy().to_string(), None => format!("untitled:{}", tab.name) };
+        self.recovery_dir().join(format!("{}.rec", simple_hash(format!("{}\0{}", self.root.to_string_lossy(), key).as_bytes())))
+    }
+
+    fn write_recovery_for_current_tab(&mut self) {
+        if !self.tab().modified {
+            let file = self.recovery_file_for(self.tab());
+            let _ = fs::remove_file(file);
+            return;
+        }
+        let file = self.recovery_file_for(self.tab());
+        let key = file.to_string_lossy().to_string();
+        if self.last_recovery_write.get(&key).map(|t| t.elapsed() < Duration::from_millis(250)).unwrap_or(false) { return; }
+        self.last_recovery_write.insert(key, Instant::now());
+        let root_s = self.root.to_string_lossy().to_string();
+        let path_s = self.tab().path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let name = self.tab().name.clone();
+        let cursor = self.tab().cursor;
+        let revision = self.tab().revision;
+        let text = self.tab().text();
+        let mut data = String::new();
+        data.push_str(&format!("root={}\n", escape_state(&root_s)));
+        data.push_str(&format!("path={}\n", escape_state(&path_s)));
+        data.push_str(&format!("name={}\n", escape_state(&name)));
+        data.push_str(&format!("cursor_line={}\n", cursor.line));
+        data.push_str(&format!("cursor_col={}\n", cursor.col));
+        data.push_str(&format!("revision={}\n", revision));
+        data.push_str("---TEXT---\n");
+        data.push_str(&text);
+        let _ = atomic_write_file(&file, data.as_bytes());
+    }
+
+    fn delete_recovery_for_tab(&self, tab: &Tab) { let _ = fs::remove_file(self.recovery_file_for(tab)); }
+    fn delete_recovery_file(&self, path: &Path) {
+        let temp = Tab { path: Some(path.to_path_buf()), name: path.file_name().and_then(OsStr::to_str).unwrap_or("Untitled").to_string(), lines: vec![String::new()], cursor: Pos { line: 0, col: 0 }, row_offset: 0, col_offset: 0, modified: false, revision: 0, saved_revision: 0, syntax_mode: None, undo: Vec::new(), redo: Vec::new(), large_file: false };
+        self.delete_recovery_for_tab(&temp);
+    }
+
+    fn offer_recovery(&mut self) {
+        let Ok(entries) = fs::read_dir(self.recovery_dir()) else { return; };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(OsStr::to_str) != Some("rec") { continue; }
+            let Ok(data) = fs::read_to_string(&path) else { continue; };
+            let Some((headers, text)) = data.split_once("---TEXT---\n") else { continue; };
+            let map = parse_state_headers(headers);
+            if map.get("root").map(String::as_str) != Some(self.root.to_string_lossy().as_ref()) { continue; }
+            let name = map.get("name").cloned().unwrap_or_else(|| "Untitled".to_string());
+            let answer = self.prompt(&format!("Recover unsaved changes for {name}? y/N: "), "");
+            if answer.to_ascii_lowercase() != "y" { let _ = fs::remove_file(&path); continue; }
+            let path_value = map.get("path").cloned().unwrap_or_default();
+            let file_path = if path_value.is_empty() { None } else { Some(PathBuf::from(path_value)) };
+            let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+            if lines.is_empty() { lines.push(String::new()); }
+            let mut tab = Tab::empty();
+            tab.path = file_path;
+            tab.name = name.clone();
+            tab.lines = lines;
+            tab.cursor.line = map.get("cursor_line").and_then(|v| v.parse().ok()).unwrap_or(0);
+            tab.cursor.line = min(tab.cursor.line, tab.lines.len().saturating_sub(1));
+            tab.cursor.col = map.get("cursor_col").and_then(|v| v.parse().ok()).unwrap_or(0);
+            tab.cursor.col = clamp_char_boundary(&tab.lines[tab.cursor.line], min(tab.cursor.col, tab.lines[tab.cursor.line].len()));
+            tab.modified = true;
+            tab.revision = map.get("revision").and_then(|v| v.parse().ok()).unwrap_or(1);
+            if self.is_hidden_initial_tab(0, &self.tabs[0]) {
+                self.tabs[0] = tab; self.tab_index = 0; self.hide_initial_untitled = false;
+            } else { self.tabs.push(tab); self.tab_index = self.tabs.len() - 1; }
+            self.message = format!("Recovered {name}");
+        }
+    }
+
+    fn try_restore_session(&mut self) {
+        if self.tabs.len() != 1 || self.tabs[0].path.is_some() { return; }
+        let Ok(data) = fs::read_to_string(self.session_file()) else { return; };
+        let mut tabs = Vec::new();
+        for line in data.lines() {
+            if let Some(rest) = line.strip_prefix("tab=") {
+                let parts: Vec<String> = rest.split('\t').map(unescape_state).collect();
+                if parts.is_empty() { continue; }
+                let path = PathBuf::from(&parts[0]);
+                if !path.is_file() { continue; }
+                if let Ok(mut tab) = Tab::from_path(path) {
+                    tab.cursor.line = parts.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    tab.cursor.line = min(tab.cursor.line, tab.lines.len().saturating_sub(1));
+                    tab.cursor.col = parts.get(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    tab.cursor.col = clamp_char_boundary(&tab.lines[tab.cursor.line], min(tab.cursor.col, tab.lines[tab.cursor.line].len()));
+                    tab.row_offset = parts.get(3).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    tab.syntax_mode = parts.get(4).and_then(|v| SyntaxMode::from_word(v));
+                    tabs.push(tab);
+                }
+            } else if let Some(rest) = line.strip_prefix("expanded=") {
+                self.expanded.insert(PathBuf::from(unescape_state(rest)));
+            } else if line == "sidebar_hidden=1" { self.sidebar_hidden = true; }
+        }
+        if !tabs.is_empty() {
+            self.tabs = tabs;
+            self.tab_index = 0;
+            self.hide_initial_untitled = false;
+            self.focus = if self.sidebar_hidden { Focus::Editor } else { Focus::Tree };
+            self.message = "Session restored".to_string();
+            self.show_welcome = false;
+            self.needs_tree_refresh = true;
+        }
+    }
+
+    fn save_session(&self) {
+        let mut out = String::new();
+        out.push_str(&format!("root={}\n", escape_state(self.root.to_string_lossy().as_ref())));
+        out.push_str(&format!("tab_index={}\n", self.tab_index));
+        out.push_str(&format!("sidebar_hidden={}\n", if self.sidebar_hidden { 1 } else { 0 }));
+        for e in &self.expanded { out.push_str(&format!("expanded={}\n", escape_state(e.to_string_lossy().as_ref()))); }
+        for tab in &self.tabs {
+            if let Some(path) = &tab.path {
+                out.push_str("tab=");
+                out.push_str(&escape_state(path.to_string_lossy().as_ref()));
+                out.push('\t'); out.push_str(&tab.cursor.line.to_string());
+                out.push('\t'); out.push_str(&tab.cursor.col.to_string());
+                out.push('\t'); out.push_str(&tab.row_offset.to_string());
+                out.push('\t'); out.push_str(tab.syntax_mode.map(|s| s.label()).unwrap_or(""));
+                out.push('\n');
+            }
+        }
+        let _ = atomic_write_file(&self.session_file(), out.as_bytes());
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Segment { pub(crate) start: usize, pub(crate) end: usize, pub(crate) color: &'static str }
+
+fn comp(label: &str, insert: &str, detail: &str) -> CompletionItem {
+    CompletionItem { label: label.to_string(), insert: insert.to_string(), detail: detail.to_string() }
+}
+
+fn highlight_segments(line: &str, syntax: SyntaxMode) -> Vec<Segment> {
+    plugins::highlight_segments(line, syntax)
+}
+
+fn color_at<'a>(segments: &'a [Segment], pos: usize) -> Option<&'static str> {
+    for seg in segments.iter().rev() { if pos >= seg.start && pos < seg.end { return Some(seg.color); } }
+    None
+}
+
+fn current_minute() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / 60 }
+
+fn time_date_text() -> String {
+    if let Ok(out) = Command::new("date").arg("+%I:%M %p  %d/%m/%Y").output() {
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else { String::new() }
+}
+
+fn absolute_path(path: &Path, base: Option<&Path>) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.unwrap_or_else(|| Path::new(".")).join(path)
+    };
+    joined.components().collect()
+}
+
+fn relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string()
+}
+
+fn atomic_write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    let tmp = path.with_file_name(format!(".{}.aztmp.{}", path.file_name().and_then(OsStr::to_str).unwrap_or("file"), std::process::id()));
+    fs::write(&tmp, bytes)?;
+    if let Ok(meta) = fs::metadata(path) { let _ = fs::set_permissions(&tmp, meta.permissions()); }
+    fs::rename(tmp, path)
+}
+
+fn ansi_fg(hex: &str) -> String { let (r, g, b) = rgb(hex); format!("\x1b[38;2;{r};{g};{b}m") }
+fn ansi_bg(hex: &str) -> String { let (r, g, b) = rgb(hex); format!("\x1b[48;2;{r};{g};{b}m") }
+fn ansi_style(fg: Option<&str>, bg: Option<&str>, bold: bool, dim: bool, underline: bool) -> String {
+    let mut s = String::new();
+    if let Some(f) = fg { s.push_str(&ansi_fg(f)); }
+    if let Some(b) = bg { s.push_str(&ansi_bg(b)); }
+    if bold { s.push_str("\x1b[1m"); }
+    if dim { s.push_str("\x1b[2m"); }
+    if underline { s.push_str("\x1b[4m"); }
+    s
+}
+fn reset_fg_bg() -> &'static str { "\x1b[0m" }
+fn rgb(hex: &str) -> (u8, u8, u8) {
+    let h = hex.trim_start_matches('#');
+    if h.len() >= 6 {
+        let r = u8::from_str_radix(&h[0..2], 16).unwrap_or(255);
+        let g = u8::from_str_radix(&h[2..4], 16).unwrap_or(255);
+        let b = u8::from_str_radix(&h[4..6], 16).unwrap_or(255);
+        (r, g, b)
+    } else { (255, 255, 255) }
+}
+
+fn visual_width(text: &str) -> usize {
+    text.chars().map(|c| if c == '\t' { 4 } else if is_wide(c) { 2 } else if c.is_control() { 2 } else { 1 }).sum()
+}
+
+fn fit_plain(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = if c == '\t' { 4 } else if is_wide(c) { 2 } else if c.is_control() { 2 } else { 1 };
+        if used + w > width { break; }
+        if c.is_control() && c != '\t' { out.push('^'); out.push(((c as u8) + 64) as char); }
+        else if c == '\t' { out.push_str("    "); }
+        else { out.push(c); }
+        used += w;
+    }
+    if used < width { out.push_str(&" ".repeat(width - used)); }
+    out
+}
+
+fn fit_ansi(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'm' { i += 1; }
+            if i < bytes.len() { i += 1; }
+            out.push_str(&text[start..i]);
+            continue;
+        }
+        let ch = next_char(text, i);
+        let w = visual_width(ch);
+        if used + w > width { break; }
+        out.push_str(ch);
+        used += w;
+        i += ch.len();
+    }
+    if used < width { out.push_str(&" ".repeat(width - used)); }
+    out
+}
+
+fn truncate_plain(text: &str, width: usize) -> String {
+    let mut s = fit_plain(text, width);
+    while s.ends_with(' ') { s.pop(); }
+    s
+}
+
+fn escape_control(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+fn word_count(lines: &[String]) -> usize { lines.iter().flat_map(|l| l.split_whitespace()).count() }
+
+fn utf8_sequence_len(b: u8) -> usize {
+    if b & 0b1111_1000 == 0b1111_0000 { 4 } else if b & 0b1111_0000 == 0b1110_0000 { 3 } else if b & 0b1110_0000 == 0b1100_0000 { 2 } else { 1 }
+}
+
+fn clamp_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = min(idx, s.len());
+    while idx > 0 && !s.is_char_boundary(idx) { idx -= 1; }
+    idx
+}
+fn next_char_boundary(s: &str, idx: usize) -> usize { let i = clamp_char_boundary(s, idx); if i >= s.len() { i } else { i + next_char(s, i).len() } }
+fn prev_char_boundary(s: &str, idx: usize) -> usize { let mut i = clamp_char_boundary(s, idx); if i == 0 { return 0; } i -= 1; while i > 0 && !s.is_char_boundary(i) { i -= 1; } i }
+fn next_char(s: &str, idx: usize) -> &str { let i = clamp_char_boundary(s, idx); let end = next_char_boundary_raw(s, i); &s[i..end] }
+fn next_char_boundary_raw(s: &str, idx: usize) -> usize { s[idx..].chars().next().map(|c| idx + c.len_utf8()).unwrap_or(idx) }
+fn prev_char(s: &str, idx: usize) -> &str { let start = prev_char_boundary(s, idx); &s[start..idx] }
+
+fn is_wide(c: char) -> bool {
+    let cp = c as u32;
+    matches!(cp, 0x1100..=0x115F | 0x2329..=0x232A | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE10..=0xFE19 | 0xFE30..=0xFE6F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6)
+}
+
+fn is_printable(key: &str) -> bool {
+    if key == "\t" { return true; }
+    if key.is_empty() || key.starts_with('\x1b') { return false; }
+    !key.chars().any(|c| c.is_control())
+}
+
+fn is_ctrl_slash(k: &str) -> bool { k == "\x1f" || k == "\x1b[47;5u" || k == "\x1b[63;5u" }
+fn is_ctrl_shift_f(k: &str) -> bool { k == "\x1b[70;6u" || k == "\x1b[102;6u" }
+fn is_ctrl_shift_z(k: &str) -> bool { k == "\x1b[90;6u" || k == "\x1b[122;6u" }
+fn is_ctrl_backspace(k: &str) -> bool { k == "\x17" || k == "\x1b[127;5u" || k == "\x1b[8;5u" }
+fn is_ctrl_left(k: &str) -> bool { matches!(k, "\x1b[1;5D" | "\x1b[5D" | "\x1bO5D" | "\x1bOd" | "\x1b[1;3D" | "\x1b[3D") }
+fn is_ctrl_right(k: &str) -> bool { matches!(k, "\x1b[1;5C" | "\x1b[5C" | "\x1bO5C" | "\x1bOc" | "\x1b[1;3C" | "\x1b[3C") }
+fn is_ctrl_shift_left(k: &str) -> bool { k == "\x1b[1;6D" || k == "\x1b[68;6u" }
+fn is_ctrl_shift_right(k: &str) -> bool { k == "\x1b[1;6C" || k == "\x1b[67;6u" }
+fn tab_number(k: &str) -> Option<usize> {
+    if k.len() == 2 && k.as_bytes()[0] == 0x1b && (b'1'..=b'9').contains(&k.as_bytes()[1]) { return Some((k.as_bytes()[1] - b'0') as usize); }
+    None
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> { haystack.windows(needle.len()).position(|w| w == needle) }
+fn remove_last_char(s: &mut String) { if let Some((idx, _)) = s.char_indices().last() { s.truncate(idx); } }
+
+fn pos_gt(a: Pos, b: Pos) -> bool { a.line > b.line || (a.line == b.line && a.col > b.col) }
+fn range_overlaps_selection(line: usize, start_col: usize, end_col: usize, a: Pos, b: Pos) -> bool {
+    let start = Pos { line, col: start_col };
+    let end = Pos { line, col: end_col };
+    pos_gt(end, a) && pos_gt(b, start)
+}
+
+fn display_cell(ch: &str) -> String {
+    if ch == "\t" { return "    ".to_string(); }
+    let mut chars = ch.chars();
+    if let Some(c) = chars.next() {
+        if c.is_control() {
+            let code = c as u32;
+            if code < 128 { return format!("^{}", ((code as u8) + 64) as char); }
+            return " ".to_string();
+        }
+    }
+    ch.to_string()
+}
+
+fn text_between(lines: &[String], start: Pos, end: Pos) -> String {
+    if start.line == end.line { return lines[start.line][start.col..end.col].to_string(); }
+    let mut out = String::new();
+    out.push_str(&lines[start.line][start.col..]);
+    out.push('\n');
+    for line in start.line + 1..end.line { out.push_str(&lines[line]); out.push('\n'); }
+    out.push_str(&lines[end.line][..end.col]);
+    out
+}
+
+fn end_pos_for_text(start: Pos, text: &str) -> Pos {
+    let parts: Vec<&str> = text.split('\n').collect();
+    if parts.len() == 1 { Pos { line: start.line, col: start.col + text.len() } } else { Pos { line: start.line + parts.len() - 1, col: parts.last().unwrap().len() } }
+}
+
+fn indent_for_newline(before: &str, after: &str) -> String {
+    let mut indent: String = before.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+    let trimmed = before.trim_end();
+    if trimmed.ends_with('{') || trimmed.ends_with('[') || trimmed.ends_with('(') || trimmed.ends_with(':') { indent.push_str("    "); }
+    let after_trim = after.trim_start();
+    if (after_trim.starts_with('}') || after_trim.starts_with(']') || after_trim.starts_with(')')) && indent.len() >= 4 { indent.truncate(indent.len() - 4); }
+    indent
+}
+
+fn find_in_line(line: &str, needle: &str, offset: usize, ignore_case: bool) -> Option<usize> {
+    let offset = clamp_char_boundary(line, min(offset, line.len()));
+    if ignore_case {
+        let hay = line[offset..].to_ascii_lowercase();
+        let n = needle.to_ascii_lowercase();
+        hay.find(&n).map(|p| offset + p)
+    } else { line[offset..].find(needle).map(|p| offset + p) }
+}
+
+fn parse_quick_open_query(query: &str) -> (bool, String, Option<usize>) {
+    let q = query.trim();
+    if let Some(rest) = q.strip_prefix(':') {
+        return (true, String::new(), rest.parse().ok());
+    }
+    if let Some((left, right)) = q.rsplit_once(':') {
+        if let Ok(n) = right.parse::<usize>() { return (false, left.to_string(), Some(n)); }
+    }
+    (false, q.to_string(), None)
+}
+
+fn quick_score(label: &str, query: &str) -> Option<i32> {
+    let label_l = label.to_ascii_lowercase();
+    let query_l = query.to_ascii_lowercase();
+    if query_l.is_empty() { return Some(0); }
+    if let Some(pos) = label_l.find(&query_l) { return Some(pos as i32); }
+    let mut score = 0i32;
+    let mut last = 0usize;
+    for ch in query_l.chars() {
+        if let Some(pos) = label_l[last..].find(ch) {
+            score += pos as i32 + 2;
+            last += pos + ch.len_utf8();
+        } else { return None; }
+    }
+    Some(score + 50)
+}
+
+fn extract_symbols(text: &str, syntax: SyntaxMode) -> Vec<(String, usize)> {
+    plugins::extract_symbols(text, syntax)
+}
+
+fn is_word_char(s: &str) -> bool { s.chars().next().map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false) }
+fn is_space_char(s: &str) -> bool { s.chars().next().map(|c| c.is_whitespace()).unwrap_or(false) }
+
+fn stty_command() -> Command {
+    let mut cmd = Command::new("stty");
+    if let Ok(tty) = File::open("/dev/tty") {
+        cmd.stdin(tty);
+    }
+    cmd
+}
+
+fn stty_output<const N: usize>(args: [&str; N]) -> io::Result<Vec<u8>> {
+    let out = stty_command().args(args).output()?;
+    if out.status.success() { Ok(out.stdout) } else { Err(io::Error::new(io::ErrorKind::Other, "stty failed")) }
+}
+
+fn stty_status<const N: usize>(args: [&str; N]) -> io::Result<()> {
+    let status = stty_command().args(args).status()?;
+    if status.success() { Ok(()) } else { Err(io::Error::new(io::ErrorKind::Other, "stty failed")) }
+}
+
+#[cfg(unix)]
+#[repr(C)]
+struct WinSize {
+    ws_row: c_ushort,
+    ws_col: c_ushort,
+    ws_xpixel: c_ushort,
+    ws_ypixel: c_ushort,
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+}
+
+#[cfg(unix)]
+fn terminal_size_from_ioctl() -> Option<(usize, usize)> {
+    const TIOCGWINSZ: c_ulong = 0x5413;
+    let tty = File::open("/dev/tty").ok();
+    let fd = tty.as_ref().map(|f| f.as_raw_fd()).unwrap_or(0);
+    let mut size = WinSize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    let ok = unsafe { ioctl(fd, TIOCGWINSZ, &mut size) } == 0;
+    if ok && size.ws_row > 0 && size.ws_col > 0 {
+        Some((size.ws_row as usize, size.ws_col as usize))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn terminal_size_from_ioctl() -> Option<(usize, usize)> { None }
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i];
+        let b1 = if i + 1 < data.len() { data[i + 1] } else { 0 };
+        let b2 = if i + 2 < data.len() { data[i + 2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+        if i + 1 < data.len() { out.push(TABLE[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char); } else { out.push('='); }
+        if i + 2 < data.len() { out.push(TABLE[(b2 & 0b11_1111) as usize] as char); } else { out.push('='); }
+        i += 3;
+    }
+    out
+}
+
+fn simple_hash(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in data { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
+    format!("{h:016x}")
+}
+
+fn escape_state(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '=' => out.push_str("\\e"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape_state(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('e') => out.push('='),
+                Some('\\') => out.push('\\'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        } else { out.push(c); }
+    }
+    out
+}
+
+fn parse_state_headers(headers: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in headers.lines() {
+        if let Some((k, v)) = line.split_once('=') { map.insert(k.to_string(), unescape_state(v)); }
+    }
+    map
+}

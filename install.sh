@@ -1,52 +1,33 @@
 #!/usr/bin/env sh
 set -eu
 
-RAW_URL="${AZ_RAW_URL:-https://raw.githubusercontent.com/arazgholami/az/refs/heads/main/az}"
+REPO_URL="${AZ_REPO_URL:-https://github.com/arazgholami/az.git}"
 BIN_DIR="${AZ_BIN_DIR:-$HOME/.local/bin}"
-TARGET="$BIN_DIR/az"
-TMP="$(mktemp)"
+TMP_DIR=""
 
 cleanup() {
-  rm -f "$TMP"
+  if [ -n "$TMP_DIR" ]; then
+    rm -rf "$TMP_DIR"
+  fi
 }
 trap cleanup EXIT INT TERM
 
-if ! command -v php >/dev/null 2>&1; then
-  echo "Error: PHP CLI is required."
-  echo "On Debian or Ubuntu, install it with: sudo apt install php-cli"
+run_from_source_tree() {
+  AZ_BIN_DIR="$BIN_DIR" ./build.sh
+}
+
+if [ -f ./Cargo.toml ] && [ -f ./src/main.rs ] && [ -x ./build.sh ]; then
+  run_from_source_tree
+  exit 0
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  echo "Error: git is required for remote install."
+  echo "Install git, or download the source zip and run ./build.sh inside it."
   exit 1
 fi
 
-mkdir -p "$BIN_DIR"
-
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$RAW_URL" -o "$TMP"
-elif command -v wget >/dev/null 2>&1; then
-  wget -qO "$TMP" "$RAW_URL"
-else
-  echo "Error: curl or wget is required."
-  exit 1
-fi
-
-chmod +x "$TMP"
-mv "$TMP" "$TARGET"
-
-case ":$PATH:" in
-  *":$BIN_DIR:"*) ;;
-  *)
-    PROFILE="$HOME/.profile"
-    LINE='export PATH="$HOME/.local/bin:$PATH"'
-
-    if [ "$BIN_DIR" = "$HOME/.local/bin" ] && [ -f "$PROFILE" ] && ! grep -F "$LINE" "$PROFILE" >/dev/null 2>&1; then
-      printf '\n%s\n' "$LINE" >> "$PROFILE"
-      echo "Added ~/.local/bin to PATH in ~/.profile."
-      echo "Restart your terminal or run: . ~/.profile"
-    else
-      echo "Note: $BIN_DIR is not in PATH."
-      echo "Add this to your shell profile: export PATH=\"$BIN_DIR:\$PATH\""
-    fi
-    ;;
-esac
-
-echo "Az installed: $TARGET"
-echo "Run it with: az"
+TMP_DIR="$(mktemp -d)"
+git clone --depth 1 "$REPO_URL" "$TMP_DIR/az" >/dev/null 2>&1
+cd "$TMP_DIR/az"
+run_from_source_tree
